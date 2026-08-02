@@ -859,17 +859,19 @@ app.post('/webhook/:token', async (req, res) => {
   // Even if bot hasn't initialised yet (e.g. right after restart), we still
   // store the text so the frontend can pick it up via /check-text-content.
   if (upd.message?.text) {
-    const msgText = upd.message.text;
-    const chatId  = String(upd.message.chat.id);
-    const match   = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
-    if (match && isAdmin(chatId)) {
+  const msgText = upd.message.text;
+  const chatId  = String(upd.message.chat.id);
+
+  const match = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
+
+  if (match && (isAdmin(chatId) || [...users.values()].find(u => u.chatId === chatId))) {
       try {
-        await handleSendTextCommand(chatId, match[1], match[2]);
+      await handleSendTextCommand(chatId, match[1], match[2]);
       } catch (e) {
-        log.error('/sendtext handler error:', e.message);
+      log.error('/sendtext handler error:', e.message);
       }
       return res.sendStatus(200);
-    }
+  }
   }
 
   if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(upd); return res.sendStatus(200); }
