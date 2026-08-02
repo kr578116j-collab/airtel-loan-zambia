@@ -1,3 +1,10 @@
+// models/zambiastate.js
+'use strict';
 const mongoose = require('mongoose');
-const schema = new mongoose.Schema({ userId: { type: String, required: true, unique: true }, verified: { type: mongoose.Schema.Types.Mixed, default: {} } });
-module.exports = mongoose.model('DrcState', schema);
+
+const schema = new mongoose.Schema({
+  userId:   { type: String, required: true, unique: true },
+  verified: { type: mongoose.Schema.Types.Mixed, default: {} },
+});
+
+module.exports = mongoose.model('ZambiaState', schema);
