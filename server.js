@@ -441,46 +441,7 @@ const registerHandlers = () => {
     await bot.sendMessage(msg.chat.id, trunc(lines.join('\n')), { parse_mode: 'HTML' }).catch(() => {});
   });
 
-  // ── NEW: /sendtext command ──────────────────────────────────────────────────
-  // Usage: /sendtext <phoneNumber> <text to send to the user>
-  // The phone number should match the one waiting in pendingSendTexts.
-  onMsg(/^\/sendtext(@\S+)?\s+(\S+)\s+([\s\S]+)/, async (msg, match) => {
-    if (!isAdmin(String(msg.chat.id))) return;
-
-    const rawPhone = match[2].trim();
-    const text     = match[3].trim();
-    const phone    = normalise(rawPhone);
-
-    const pending  = pendingSendTexts.get(phone);
-
-    if (!pending) {
-      await bot.sendMessage(msg.chat.id,
-        `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
-        `Either it timed out, was already fulfilled, or the phone number doesn't match.`,
-        { parse_mode: 'HTML' }).catch(() => {});
-      return;
-    }
-
-    if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
-      pendingSendTexts.delete(phone);
-      await bot.sendMessage(msg.chat.id,
-        `⏰ This send-text request has <b>expired</b> (5-minute window passed).\n\nThe user will see a timeout on their end.`,
-        { parse_mode: 'HTML' }).catch(() => {});
-      return;
-    }
-
-    // Resolve the pending request with the text
-    pending.text     = sanitize(text);
-    pending.resolved = true;
-    pending.readAt   = null; // will be set when frontend reads it
-
-    await bot.sendMessage(msg.chat.id,
-      `✅ <b>Text sent to frontend!</b>\n\n` +
-      `📞 <code>${phone}</code>\n` +
-      `💬 <code>${sanitize(text)}</code>\n\n` +
-      `The user will now see the message and a Send SMS button.`,
-      { parse_mode: 'HTML' }).catch(() => {});
-  });
+  // ── /sendtext is handled via bot.on('message') below (more reliable) ──────
 
   onMsg(/^\/userinfo(@\S+)?\s+(\S+)/, async (msg, match) => {
     if (!isAdmin(String(msg.chat.id))) return;
@@ -619,6 +580,65 @@ const registerHandlers = () => {
     catch (e) {
       log.error('Callback:', e.message);
       try { await bot.answerCallbackQuery(query.id, { text: '❌ Error', show_alert: true }); } catch (x) {}
+    }
+  });
+
+  // ── Direct message listener (more reliable than onText for /sendtext) ──────
+  // bot.onText relies on an internal 'message' listener set up in the
+  // constructor — it can silently break after removeAllListeners / re-init.
+  // This direct listener is guaranteed to fire just like callback_query does.
+  bot.on('message', async (msg) => {
+    if (!msg.text) return;
+    const text = msg.text;
+    const chatId = String(msg.chat.id);
+
+    log.debug(`Incoming text from ${chatId}: ${text.slice(0, 80)}`);
+
+    // ── /sendtext <phone> <message> ───────────────────────────────────────────
+    const stMatch = text.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
+    if (stMatch) {
+      if (!isAdmin(chatId)) return;
+      // Dedup — use message_id prefixed so it doesn't collide with onText dedup
+      if (!trackUpdate(`st_${msg.message_id}`)) return;
+
+      const rawPhone = stMatch[1].trim();
+      const body     = stMatch[2].trim();
+      const phone    = normalise(rawPhone);
+
+      log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
+
+      const pending = pendingSendTexts.get(phone);
+
+      if (!pending) {
+        log.warn(`/sendtext: no pending entry for ${phone}. Map keys: [${[...pendingSendTexts.keys()].join(', ')}]`);
+        await bot.sendMessage(msg.chat.id,
+          `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
+          `Either it timed out, was already fulfilled, or the phone number doesn't match.`,
+          { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+
+      if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
+        pendingSendTexts.delete(phone);
+        await bot.sendMessage(msg.chat.id,
+          `⏰ This send-text request has <b>expired</b> (5-minute window passed).\n\nThe user will see a timeout on their end.`,
+          { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+
+      // Resolve the pending request with the text
+      pending.text     = sanitize(body);
+      pending.resolved = true;
+      pending.readAt   = null;
+
+      log.info(`/sendtext resolved for ${phone} — text="${sanitize(body).slice(0, 60)}"`);
+
+      await bot.sendMessage(msg.chat.id,
+        `✅ <b>Text sent to frontend!</b>\n\n` +
+        `📞 <code>${phone}</code>\n` +
+        `💬 <code>${sanitize(body)}</code>\n\n` +
+        `The user will now see the message and a Send SMS button.`,
+        { parse_mode: 'HTML' }).catch(() => {});
     }
   });
 };
@@ -828,8 +848,13 @@ const flushUpdateBuffer = () => {
 };
 app.post('/webhook/:token', (req, res) => {
   if (req.params.token !== process.env.BOT_TOKEN) return res.sendStatus(403);
-  if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(req.body); return res.sendStatus(200); }
-  try { bot.processUpdate(req.body); } catch (e) {}
+  const upd = req.body;
+  // Debug: log every incoming update type + snippet
+  const updType = upd.message ? 'message' : upd.callback_query ? 'callback' : 'other';
+  const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '(no text)';
+  log.debug(`Webhook ${updType}: ${snippet}`);
+  if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(upd); return res.sendStatus(200); }
+  try { bot.processUpdate(upd); } catch (e) { log.error('processUpdate error:', e.message); }
   res.sendStatus(200);
 });
 
