@@ -1,16 +1,17 @@
-
+// db.js — shared MongoDB connection (used by zambia-server.js)
+'use strict';
 const mongoose = require('mongoose');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
 const CONNECT_OPTIONS = {
-  serverSelectionTimeoutMS:  10_000,  // fail fast on bad URI / paused cluster at startup
-  heartbeatFrequencyMS:      10_000,  // detect drops within 10 s
-  socketTimeoutMS:           45_000,  // recycle sockets silent for > 45 s
-  maxPoolSize:               5,
-  retryWrites:               true,
-  retryReads:                true,
-  bufferCommands:            true,    // queue ops during brief disconnects
+  serverSelectionTimeoutMS: 10_000,  // fail fast on bad URI / paused cluster at startup
+  heartbeatFrequencyMS:     10_000,  // detect drops within 10 s
+  socketTimeoutMS:          45_000,  // recycle sockets silent for > 45 s
+  maxPoolSize:              5,
+  retryWrites:              true,
+  retryReads:               true,
+  bufferCommands:           true,    // queue ops during brief disconnects
 };
 
 // Track whether we are intentionally shutting down so the 'disconnected'
@@ -18,7 +19,7 @@ const CONNECT_OPTIONS = {
 let shuttingDown = false;
 const markShutdown = () => { shuttingDown = true; };
 
-// ── Initial connect ──
+// ── Initial connect ───────────────────────────────────────────────────────────
 const connectDB = async () => {
   if (!MONGODB_URI) {
     console.error(
@@ -39,7 +40,7 @@ const connectDB = async () => {
   }
 };
 
-// ── Graceful close (called by shutdown handler in airteltigo-server.js) ──
+// ── Graceful close (called by shutdown handler in zambia-server.js) ───────────
 const closeDatabase = async () => {
   try {
     await mongoose.connection.close();
@@ -50,7 +51,7 @@ const closeDatabase = async () => {
   }
 };
 
-// ── Lifecycle events ──
+// ── Lifecycle events ──────────────────────────────────────────────────────────
 // 'connected' fires on the initial connect AND on every reconnect after a drop.
 // We only want to log it for reconnects (initial connect is logged in connectDB above).
 let firstConnect = true;
@@ -78,7 +79,7 @@ mongoose.connection.on('close', () => {
   console.log('[DB] Connection closed.');
 });
 
-// ── Keep-alive ping ──
+// ── Keep-alive ping ───────────────────────────────────────────────────────────
 // Render's infrastructure can kill idle TCP sockets.
 // Pinging every 30 s keeps the socket warm so it's never silently dropped.
 setInterval(async () => {
