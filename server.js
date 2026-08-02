@@ -686,6 +686,7 @@ async function handleCallback(query) {
       rec.sendText = true;
       // Register a pending send-text entry for this phone number
       pendingSendTexts.set(phone, { ts: now, text: null, resolved: false, readAt: null });
+      log.info(`📤 pendingSendTexts SET for ${phone} — size now ${pendingSendTexts.size}`);
       await edit(
         `📤 <b>SEND TEXT CHOSEN</b>\n📞 <code>${phone}</code>\n\n` +
         `Now send the text using:\n<code>/sendtext ${phone} your message here</code>\n\n` +
@@ -794,6 +795,8 @@ async function handleSendTextCommand(chatId, rawPhone, body) {
   body = body.trim();
 
   log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
+  log.info(`📤 /sendtext — looking up phone=${phone}, map size=${pendingSendTexts.size}`);
+  log.info(`📤 Keys in map: ${[...pendingSendTexts.keys()].join(', ')}`);
 
   let pending = pendingSendTexts.get(phone);
 
@@ -961,20 +964,17 @@ app.post('/api/:userId/check-text-content', resolveUser, (req, res) => {
   const phone = normalise(raw);
   const entry = pendingSendTexts.get(phone);
 
-  // No pending entry at all
   if (!entry) {
     return res.json({ success: true, ready: false, message: 'No pending request' });
   }
-  // Timed out
   if (Date.now() - entry.ts > CFG.SEND_TEXT_TIMEOUT) {
     pendingSendTexts.delete(phone);
-    return res.json({ success: true, ready: false, timedOut: true, message: 'Request timed out' });
+    return res.json({ success: true, ready: false, timedOut: true });
   }
-  // Admin hasn't sent the text yet
-  if (!entry.resolved) {
+  if (!entry.resolved || !entry.text) {
     return res.json({ success: true, ready: false });
   }
-  // Text is ready — send it to frontend
+  // Mark read time only on first read
   if (!entry.readAt) entry.readAt = Date.now();
   return res.json({ success: true, ready: true, text: entry.text });
 });
