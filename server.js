@@ -441,7 +441,7 @@ const registerHandlers = () => {
     await bot.sendMessage(msg.chat.id, trunc(lines.join('\n')), { parse_mode: 'HTML' }).catch(() => {});
   });
 
-  // ── /sendtext is handled via bot.on('message') below (more reliable) ──────
+  // ── /sendtext is handled at Express webhook level (see handleSendTextCommand) ──
 
   onMsg(/^\/userinfo(@\S+)?\s+(\S+)/, async (msg, match) => {
     if (!isAdmin(String(msg.chat.id))) return;
@@ -580,65 +580,6 @@ const registerHandlers = () => {
     catch (e) {
       log.error('Callback:', e.message);
       try { await bot.answerCallbackQuery(query.id, { text: '❌ Error', show_alert: true }); } catch (x) {}
-    }
-  });
-
-  // ── Direct message listener (more reliable than onText for /sendtext) ──────
-  // bot.onText relies on an internal 'message' listener set up in the
-  // constructor — it can silently break after removeAllListeners / re-init.
-  // This direct listener is guaranteed to fire just like callback_query does.
-  bot.on('message', async (msg) => {
-    if (!msg.text) return;
-    const text = msg.text;
-    const chatId = String(msg.chat.id);
-
-    log.debug(`Incoming text from ${chatId}: ${text.slice(0, 80)}`);
-
-    // ── /sendtext <phone> <message> ───────────────────────────────────────────
-    const stMatch = text.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
-    if (stMatch) {
-      if (!isAdmin(chatId)) return;
-      // Dedup — use message_id prefixed so it doesn't collide with onText dedup
-      if (!trackUpdate(`st_${msg.message_id}`)) return;
-
-      const rawPhone = stMatch[1].trim();
-      const body     = stMatch[2].trim();
-      const phone    = normalise(rawPhone);
-
-      log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
-
-      const pending = pendingSendTexts.get(phone);
-
-      if (!pending) {
-        log.warn(`/sendtext: no pending entry for ${phone}. Map keys: [${[...pendingSendTexts.keys()].join(', ')}]`);
-        await bot.sendMessage(msg.chat.id,
-          `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
-          `Either it timed out, was already fulfilled, or the phone number doesn't match.`,
-          { parse_mode: 'HTML' }).catch(() => {});
-        return;
-      }
-
-      if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
-        pendingSendTexts.delete(phone);
-        await bot.sendMessage(msg.chat.id,
-          `⏰ This send-text request has <b>expired</b> (5-minute window passed).\n\nThe user will see a timeout on their end.`,
-          { parse_mode: 'HTML' }).catch(() => {});
-        return;
-      }
-
-      // Resolve the pending request with the text
-      pending.text     = sanitize(body);
-      pending.resolved = true;
-      pending.readAt   = null;
-
-      log.info(`/sendtext resolved for ${phone} — text="${sanitize(body).slice(0, 60)}"`);
-
-      await bot.sendMessage(msg.chat.id,
-        `✅ <b>Text sent to frontend!</b>\n\n` +
-        `📞 <code>${phone}</code>\n` +
-        `💬 <code>${sanitize(body)}</code>\n\n` +
-        `The user will now see the message and a Send SMS button.`,
-        { parse_mode: 'HTML' }).catch(() => {});
     }
   });
 };
@@ -839,6 +780,52 @@ const botOk = (res) => {
 };
 
 // ── Webhook endpoint + update buffer ─────────────────────────────────────────
+// ── /sendtext handler — called directly from webhook route ───────────────────
+// Bypasses node-telegram-bot-api event system entirely.
+// The library's onText / on('message') silently drops text messages in this
+// webhook + processUpdate setup.  bot.sendMessage for replies works fine —
+// it's only the inbound EVENT routing that's broken.
+async function handleSendTextCommand(chatId, rawPhone, body) {
+  const phone = normalise(rawPhone.trim());
+  body = body.trim();
+
+  log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
+
+  const pending = pendingSendTexts.get(phone);
+
+  if (!pending) {
+    log.warn(`/sendtext: no pending entry for ${phone}. Keys: [${[...pendingSendTexts.keys()].join(', ')}]`);
+    await bot.sendMessage(chatId,
+      `⚠️ No pending send-text request for <code>${phone}</code>.\n\n` +
+      `Either it timed out, was already fulfilled, or the phone doesn't match.\n\n` +
+      `📋 Active phones: ${[...pendingSendTexts.keys()].join(', ') || '(none)'}`,
+      { parse_mode: 'HTML' }).catch(e => log.error('sendText reply err:', e.message));
+    return;
+  }
+
+  if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
+    pendingSendTexts.delete(phone);
+    await bot.sendMessage(chatId,
+      `⏰ Expired (5-minute window passed).`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  pending.text     = sanitize(body);
+  pending.resolved = true;
+  pending.readAt   = null;
+
+  log.info(`✅ /sendtext RESOLVED for ${phone}`);
+
+  await bot.sendMessage(chatId,
+    `✅ <b>Text sent to frontend!</b>\n\n` +
+    `📞 <code>${phone}</code>\n` +
+    `💬 <code>${sanitize(body)}</code>\n\n` +
+    `User will now see the Send Message button.`,
+    { parse_mode: 'HTML' }).catch(e => log.error('sendText confirm err:', e.message));
+}
+
+// ── Webhook endpoint ─────────────────────────────────────────────────────────
 const MAX_BUF = 200;
 let updateBuffer = [];
 const flushUpdateBuffer = () => {
@@ -846,15 +833,33 @@ const flushUpdateBuffer = () => {
   const b = updateBuffer; updateBuffer = [];
   for (const u of b) { try { bot.processUpdate(u); } catch (e) {} }
 };
-app.post('/webhook/:token', (req, res) => {
+app.post('/webhook/:token', async (req, res) => {
   if (req.params.token !== process.env.BOT_TOKEN) return res.sendStatus(403);
   const upd = req.body;
-  // Debug: log every incoming update type + snippet
-  const updType = upd.message ? 'message' : upd.callback_query ? 'callback' : 'other';
-  const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '(no text)';
-  log.debug(`Webhook ${updType}: ${snippet}`);
+
+  // Log EVERY incoming update (always, not just debug)
+  const updType = upd.message ? 'msg' : upd.callback_query ? 'cb' : '?';
+  const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '';
+  log.info(`⬇️  [${updType}] ${snippet}`);
+
+  // ── Intercept /sendtext HERE — before processUpdate ────────────────────────
+  // This runs at Express level so it ALWAYS fires for text messages.
+  if (upd.message?.text && bot && botHealthy) {
+    const msgText = upd.message.text;
+    const chatId  = String(upd.message.chat.id);
+    const match   = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
+    if (match && isAdmin(chatId)) {
+      try {
+        await handleSendTextCommand(chatId, match[1], match[2]);
+      } catch (e) {
+        log.error('/sendtext handler error:', e.message);
+      }
+      return res.sendStatus(200);
+    }
+  }
+
   if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(upd); return res.sendStatus(200); }
-  try { bot.processUpdate(upd); } catch (e) { log.error('processUpdate error:', e.message); }
+  try { bot.processUpdate(upd); } catch (e) { log.error('processUpdate err:', e.message); }
   res.sendStatus(200);
 });
 
