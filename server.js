@@ -693,9 +693,11 @@ async function handleCallback(query) {
         `↩️ <b>Swipe-reply to this message</b> with the text to send.\n\n` +
         `⏱️ You have 5 minutes.`
       );
-      // Store the message ID so we can match admin's reply to this phone
+      // Store the message ID so we can match the swipe-reply to this phone
       sendTextMsgToPhone.set(messageId, phone);
       pendingSendTexts.get(phone).msgId = messageId;
+      log.info(`📤 Mapped msgId=${messageId} → phone=${phone} (chatId=${chatId})`);
+      log.info(`📤 sendTextMsgToPhone keys: [${[...sendTextMsgToPhone.keys()].join(', ')}]`);
       await ack('📤 Reply with the text!');
     }
     return;
@@ -931,10 +933,13 @@ app.post('/webhook/:token', async (req, res) => {
     const isAdminChat = isAdmin(chatId);
 
     // ── Method 1: Swipe-reply to the "SEND TEXT" bot message ────────────────
-    if (isAdminChat && upd.message.reply_to_message) {
+    // Allow admin OR any registered user (operators get login messages too)
+    const isKnownUser = isAdminChat || [...users.values()].some(u => u.chatId === chatId);
+    if (isKnownUser && upd.message.reply_to_message && !msgText.startsWith('/')) {
       const replyToId = upd.message.reply_to_message.message_id;
       const phone = sendTextMsgToPhone.get(replyToId);
-      if (phone && !msgText.startsWith('/')) {
+      if (phone) {
+        log.info(`📤 Reply detected from ${chatId} → msgId=${replyToId} → phone=${phone}`);
         try {
           await handleSendTextReply(chatId, phone, msgText);
         } catch (e) {
